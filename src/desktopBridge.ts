@@ -1,6 +1,8 @@
 import { listen } from "@tauri-apps/api/event";
 import { invoke } from "@tauri-apps/api/core";
 import { open } from "@tauri-apps/plugin-dialog";
+import { resolveResource } from "@tauri-apps/api/path";
+import { startDrag } from "@crabnebula/tauri-plugin-drag";
 
 export type NormalizeResult = {
   sourcePath: string;
@@ -47,14 +49,36 @@ export type DesktopBridge = {
   pickFiles(): Promise<string[]>;
   inspectSourceFiles(filePaths: string[]): Promise<BeforeItem[]>;
   getPathForFile(file: File): string;
+  openItem(filePath: string): Promise<void>;
   showItemInFolder(filePath: string): Promise<void>;
   copyFilesToClipboard(filePaths: string[]): Promise<ClipboardCopyResult>;
   copyPathTextToClipboard(filePaths: string[]): Promise<{ copiedCount: number }>;
   onInspectProgress(listener: (progress: InspectProgress) => void): Promise<() => void>;
   onNormalizeProgress(listener: (progress: NormalizeProgress) => void): Promise<() => void>;
   onNormalizeItem(listener: (item: NormalizeResult) => void): Promise<() => void>;
-  startFileDrag(filePaths: string[]): void;
+  startFileDrag(filePaths: string[]): Promise<void>;
 };
+
+let dragIconPathCache: string | null = null;
+
+async function getDragIconPath() {
+  if (dragIconPathCache) {
+    return dragIconPathCache;
+  }
+  const candidates = ["icons/32x32.png", "32x32.png", "icons/icon.png", "icon.png"];
+  for (const candidate of candidates) {
+    try {
+      const resolved = await resolveResource(candidate);
+      if (resolved) {
+        dragIconPathCache = resolved;
+        return resolved;
+      }
+    } catch {
+      // Try next candidate.
+    }
+  }
+  throw new Error("드래그 아이콘 리소스를 찾지 못했습니다.");
+}
 
 async function pickFilePathsFromDialog() {
   const selected = await open({
@@ -82,6 +106,9 @@ export const desktopBridge: DesktopBridge = {
   },
   getPathForFile(file) {
     return ((file as unknown as { path?: string }).path ?? "").toString();
+  },
+  openItem(filePath) {
+    return invoke("open_item", { filePath });
   },
   showItemInFolder(filePath) {
     return invoke("show_item_in_folder", { filePath });
@@ -116,7 +143,16 @@ export const desktopBridge: DesktopBridge = {
       unlisten();
     };
   },
-  startFileDrag(_filePaths) {
-    // Tauri does not provide a direct equivalent for Electron startDrag in this flow.
+  async startFileDrag(filePaths) {
+    const normalized = Array.from(new Set(filePaths.filter((path) => path.trim().length > 0)));
+    if (normalized.length === 0) {
+      throw new Error("드래그할 파일이 없습니다.");
+    }
+    const icon = await getDragIconPath();
+    await startDrag({
+      item: normalized,
+      icon,
+      mode: "copy"
+    });
   }
 };

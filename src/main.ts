@@ -37,6 +37,7 @@ declare global {
       pickFiles(): Promise<string[]>;
       inspectSourceFiles(filePaths: string[]): Promise<BeforeItem[]>;
       getPathForFile(file: File): string;
+      openItem(filePath: string): Promise<void>;
       showItemInFolder(filePath: string): Promise<void>;
       copyFilesToClipboard(filePaths: string[]): Promise<{
         copiedCount: number;
@@ -52,7 +53,7 @@ declare global {
       onInspectProgress(listener: (progress: InspectProgress) => void): Promise<() => void>;
       onNormalizeProgress(listener: (progress: NormalizeProgress) => void): Promise<() => void>;
       onNormalizeItem(listener: (item: NormalizeResult) => void): Promise<() => void>;
-      startFileDrag(filePaths: string[]): void;
+      startFileDrag(filePaths: string[]): Promise<void>;
     };
   }
 }
@@ -61,6 +62,7 @@ window.desktopBridge = desktopBridge;
 
 const state = {
   beforeItems: [] as BeforeItem[],
+  selectedBeforePaths: new Set<string>(),
   beforeNfdOnly: false,
   results: [] as NormalizeResult[],
   selectedOutputPaths: new Set<string>(),
@@ -70,8 +72,10 @@ const state = {
   progressPulseTimerId: 0,
   beforeDragDepth: 0,
   beforeDragHoverTimerId: 0,
-  busy: false
+  busy: false,
+  darkMode: false
 };
+const SELECTED_CARD_CLASSES = ["border-sky-300", "bg-sky-100/60", "text-stone-900", "shadow-sm", "shadow-sky-100"];
 const LIST_CLASS =
   "scroll-fade relative grid content-start auto-rows-max h-[460px] max-h-[460px] min-h-[460px] gap-2 overflow-y-auto overflow-x-hidden pl-2 pr-4 py-2 [scrollbar-gutter:stable]";
 const LIST_CLASS_EMPTY =
@@ -85,9 +89,22 @@ if (!app) {
 
 app.innerHTML = `
   <main class="flex h-full w-full flex-col gap-3 overflow-hidden p-3">
-    <section class="rounded-2xl border border-stone-200/80 bg-white/90 p-4 shadow-soft backdrop-blur">
-      <div class="mb-2 flex flex-col gap-1">
+    <section id="top-section" class="rounded-2xl border border-stone-200/80 bg-white/90 p-4 shadow-soft backdrop-blur">
+      <div class="mb-2 flex items-center justify-between gap-3">
         <h1 class="text-xl font-extrabold tracking-tight text-stone-900 sm:text-2xl">File Path Renamer (NFD -> NFC)</h1>
+        <button
+          id="theme-toggle"
+          class="inline-flex h-8 w-8 items-center justify-center rounded-md border border-stone-300 bg-stone-50 text-stone-700 transition hover:border-stone-400 hover:bg-stone-100"
+          type="button"
+          aria-pressed="false"
+          aria-label="다크 모드 켜기"
+          title="다크 모드 켜기"
+        >
+          <svg viewBox="0 0 20 20" aria-hidden="true" class="h-4 w-4 fill-none stroke-current stroke-[1.8]">
+            <circle cx="10" cy="10" r="3.5" />
+            <path d="M10 2.5v2M10 15.5v2M2.5 10h2M15.5 10h2M4.7 4.7l1.4 1.4M13.9 13.9l1.4 1.4M15.3 4.7l-1.4 1.4M6.1 13.9l-1.4 1.4" stroke-linecap="round" />
+          </svg>
+        </button>
       </div>
       <div>
         <p id="status-text" class="status-idle hidden h-0 text-xs leading-5">아직 처리된 파일이 없습니다.</p>
@@ -169,7 +186,7 @@ app.innerHTML = `
         </div>
       </section>
 
-      <section class="relative rounded-2xl border border-stone-200/80 bg-white/90 p-4 shadow-soft backdrop-blur">
+      <section id="after-section" class="relative rounded-2xl border border-stone-200/80 bg-white/90 p-4 shadow-soft backdrop-blur">
         <div class="mb-3 flex items-start justify-between gap-3">
           <div>
             <p class="text-[11px] font-semibold uppercase tracking-[0.18em] text-stone-400">After</p>
@@ -210,6 +227,68 @@ app.innerHTML = `
       </section>
     </section>
   </main>
+  <div
+    id="after-context-menu"
+    class="fixed z-[140] hidden min-w-[140px] rounded-md border border-stone-300 bg-white p-1 shadow-lg"
+    role="menu"
+    aria-hidden="true"
+  >
+    <button
+      id="after-context-select-all"
+      class="flex w-full items-center rounded px-2 py-1.5 text-left text-xs text-stone-700 transition hover:bg-stone-100 disabled:cursor-not-allowed disabled:opacity-40"
+      type="button"
+      role="menuitem"
+    >
+      전체 선택
+    </button>
+    <button
+      id="after-context-copy-paths"
+      class="mt-0.5 flex w-full items-center rounded px-2 py-1.5 text-left text-xs text-stone-700 transition hover:bg-stone-100 disabled:cursor-not-allowed disabled:opacity-40"
+      type="button"
+      role="menuitem"
+    >
+      경로 복사
+    </button>
+    <button
+      id="after-context-copy-files"
+      class="mt-0.5 flex w-full items-center rounded px-2 py-1.5 text-left text-xs text-stone-700 transition hover:bg-stone-100 disabled:cursor-not-allowed disabled:opacity-40"
+      type="button"
+      role="menuitem"
+    >
+      파일 복사
+    </button>
+  </div>
+  <div
+    id="copy-toast"
+    class="pointer-events-none fixed bottom-3 right-3 z-[150] hidden w-[min(380px,calc(100vw-1.5rem))] rounded-xl border border-sky-200 bg-white p-3 shadow-lg"
+    aria-live="polite"
+  >
+    <p id="copy-toast-title" class="text-xs font-semibold text-sky-700"></p>
+    <div id="copy-toast-list" class="mt-1 max-h-36 overflow-y-auto text-[11px] leading-4 text-stone-700"></div>
+  </div>
+  <div
+    id="before-context-menu"
+    class="fixed z-[140] hidden min-w-[140px] rounded-md border border-stone-300 bg-white p-1 shadow-lg"
+    role="menu"
+    aria-hidden="true"
+  >
+    <button
+      id="before-context-convert"
+      class="flex w-full items-center rounded px-2 py-1.5 text-left text-xs text-stone-700 transition hover:bg-stone-100 disabled:cursor-not-allowed disabled:opacity-40"
+      type="button"
+      role="menuitem"
+    >
+      변환 하기
+    </button>
+    <button
+      id="before-context-clear"
+      class="mt-0.5 flex w-full items-center rounded px-2 py-1.5 text-left text-xs text-stone-700 transition hover:bg-stone-100 disabled:cursor-not-allowed disabled:opacity-40"
+      type="button"
+      role="menuitem"
+    >
+      전체 삭제
+    </button>
+  </div>
 `;
 
 const beforeList = document.querySelector<HTMLDivElement>("#before-list");
@@ -233,6 +312,17 @@ const copySelectionButton = document.querySelector<HTMLButtonElement>("#copy-sel
 const copyPathsButton = document.querySelector<HTMLButtonElement>("#copy-paths");
 const centerConvertButton = document.querySelector<HTMLButtonElement>("#center-convert");
 const centerRefreshButton = document.querySelector<HTMLButtonElement>("#center-refresh");
+const afterContextMenu = document.querySelector<HTMLDivElement>("#after-context-menu");
+const afterContextCopyFilesButton = document.querySelector<HTMLButtonElement>("#after-context-copy-files");
+const afterContextSelectAllButton = document.querySelector<HTMLButtonElement>("#after-context-select-all");
+const afterContextCopyPathsButton = document.querySelector<HTMLButtonElement>("#after-context-copy-paths");
+const copyToast = document.querySelector<HTMLDivElement>("#copy-toast");
+const copyToastTitle = document.querySelector<HTMLParagraphElement>("#copy-toast-title");
+const copyToastList = document.querySelector<HTMLDivElement>("#copy-toast-list");
+const beforeContextMenu = document.querySelector<HTMLDivElement>("#before-context-menu");
+const beforeContextConvertButton = document.querySelector<HTMLButtonElement>("#before-context-convert");
+const beforeContextClearButton = document.querySelector<HTMLButtonElement>("#before-context-clear");
+const themeToggleButton = document.querySelector<HTMLButtonElement>("#theme-toggle");
 
 if (
   !beforeList ||
@@ -255,9 +345,144 @@ if (
   !copySelectionButton ||
   !copyPathsButton ||
   !centerConvertButton ||
-  !centerRefreshButton
+  !centerRefreshButton ||
+  !afterContextMenu ||
+  !afterContextCopyFilesButton ||
+  !afterContextSelectAllButton ||
+  !afterContextCopyPathsButton ||
+  !copyToast ||
+  !copyToastTitle ||
+  !copyToastList ||
+  !beforeContextMenu ||
+  !beforeContextConvertButton ||
+  !beforeContextClearButton ||
+  !themeToggleButton
 ) {
   throw new Error("Failed to initialize UI.");
+}
+
+let copyToastTimerId = 0;
+const afterCardElementMap = new Map<string, HTMLElement>();
+const THEME_STORAGE_KEY = "file-path-renamer-theme";
+const systemThemeMediaQuery = window.matchMedia("(prefers-color-scheme: dark)");
+
+function isThemePinnedByUser() {
+  const stored = window.localStorage.getItem(THEME_STORAGE_KEY);
+  return stored === "dark" || stored === "light";
+}
+
+function applyTheme(darkMode: boolean, save = false) {
+  state.darkMode = darkMode;
+  document.body.classList.toggle("theme-dark", darkMode);
+  const label = darkMode ? "라이트 모드로 전환" : "다크 모드로 전환";
+  themeToggleButton.setAttribute("aria-label", label);
+  themeToggleButton.title = label;
+  themeToggleButton.innerHTML = darkMode
+    ? `
+      <svg viewBox="0 0 20 20" aria-hidden="true" class="h-4 w-4 fill-current">
+        <path d="M12.5 2.8c.2 0 .3.2.2.3a7 7 0 1 0 4.2 10.8c.1-.2.4-.2.5 0 .1.1.1.3 0 .4a8 8 0 1 1-5.2-11.5h.3Z" />
+      </svg>
+    `
+    : `
+      <svg viewBox="0 0 20 20" aria-hidden="true" class="h-4 w-4 fill-none stroke-current stroke-[1.8]">
+        <circle cx="10" cy="10" r="3.5" />
+        <path d="M10 2.5v2M10 15.5v2M2.5 10h2M15.5 10h2M4.7 4.7l1.4 1.4M13.9 13.9l1.4 1.4M15.3 4.7l-1.4 1.4M6.1 13.9l-1.4 1.4" stroke-linecap="round" />
+      </svg>
+    `;
+  themeToggleButton.setAttribute("aria-pressed", darkMode ? "true" : "false");
+  if (save) {
+    window.localStorage.setItem(THEME_STORAGE_KEY, darkMode ? "dark" : "light");
+  }
+}
+
+function initializeTheme() {
+  const stored = window.localStorage.getItem(THEME_STORAGE_KEY);
+  if (stored === "dark") {
+    applyTheme(true);
+    return;
+  }
+  if (stored === "light") {
+    applyTheme(false);
+    return;
+  }
+  applyTheme(systemThemeMediaQuery.matches);
+}
+
+function handleSystemThemeChange(event: MediaQueryListEvent) {
+  if (isThemePinnedByUser()) {
+    return;
+  }
+  applyTheme(event.matches);
+}
+
+function setupSystemThemeWatcher() {
+  if ("addEventListener" in systemThemeMediaQuery) {
+    systemThemeMediaQuery.addEventListener("change", handleSystemThemeChange);
+    return;
+  }
+  systemThemeMediaQuery.addListener(handleSystemThemeChange);
+}
+
+function showCopyToast(title: string, names: string[]) {
+  if (copyToastTimerId !== 0) {
+    window.clearTimeout(copyToastTimerId);
+    copyToastTimerId = 0;
+  }
+  copyToastTitle.textContent = title;
+  const previewNames = names
+    .slice(0, 10)
+    .map((name) => `<p class="truncate">• ${escapeHtml(name)}</p>`)
+    .join("");
+  const remain = names.length - Math.min(names.length, 10);
+  const tail = remain > 0 ? `<p class="mt-0.5 text-stone-500">외 ${remain}개</p>` : "";
+  copyToastList.innerHTML = `${previewNames}${tail}`;
+  copyToast.classList.remove("hidden");
+  copyToastTimerId = window.setTimeout(() => {
+    copyToast.classList.add("hidden");
+    copyToastTimerId = 0;
+  }, 3400);
+}
+
+function hideAfterContextMenu() {
+  afterContextMenu.classList.add("hidden");
+  afterContextMenu.setAttribute("aria-hidden", "true");
+}
+
+function hideBeforeContextMenu() {
+  beforeContextMenu.classList.add("hidden");
+  beforeContextMenu.setAttribute("aria-hidden", "true");
+}
+
+function showAfterContextMenu(x: number, y: number) {
+  const menuWidth = 152;
+  const menuHeight = 112;
+  const nextX = Math.min(Math.max(8, x), window.innerWidth - menuWidth - 8);
+  const nextY = Math.min(Math.max(8, y), window.innerHeight - menuHeight - 8);
+  afterContextMenu.style.left = `${nextX}px`;
+  afterContextMenu.style.top = `${nextY}px`;
+  afterContextMenu.classList.remove("hidden");
+  afterContextMenu.setAttribute("aria-hidden", "false");
+  const hasSelection = state.selectedOutputPaths.size > 0;
+  const hasResults = state.results.length > 0;
+  afterContextCopyFilesButton.disabled = !hasSelection;
+  afterContextSelectAllButton.disabled = !hasResults;
+  afterContextCopyPathsButton.disabled = !hasSelection;
+}
+
+function showBeforeContextMenu(x: number, y: number) {
+  const menuWidth = 152;
+  const menuHeight = 80;
+  const nextX = Math.min(Math.max(8, x), window.innerWidth - menuWidth - 8);
+  const nextY = Math.min(Math.max(8, y), window.innerHeight - menuHeight - 8);
+  beforeContextMenu.style.left = `${nextX}px`;
+  beforeContextMenu.style.top = `${nextY}px`;
+  beforeContextMenu.classList.remove("hidden");
+  beforeContextMenu.setAttribute("aria-hidden", "false");
+
+  const hasBeforeFiles = getSelectedBeforeFileCount() > 0;
+  const hasConvertible = getSelectedBeforeConvertibleCount() > 0;
+  beforeContextClearButton.disabled = state.beforeItems.length === 0;
+  beforeContextConvertButton.disabled = !hasBeforeFiles || !hasConvertible || state.busy;
 }
 
 function appendStatusLog(message: string, tone: "idle" | "error" | "success" = "idle") {
@@ -282,7 +507,7 @@ function appendStatusLog(message: string, tone: "idle" | "error" | "success" = "
 
 const pathTooltip = document.createElement("div");
 pathTooltip.className =
-  "pointer-events-none fixed z-[120] max-w-[760px] rounded-md border border-stone-300 bg-white px-2 py-1 text-[11px] leading-4 text-stone-700 shadow-lg opacity-0 transition-opacity duration-75";
+  "theme-path-tooltip pointer-events-none fixed z-[120] max-w-[760px] rounded-md border border-stone-300 bg-white px-2 py-1 text-[11px] leading-4 text-stone-700 shadow-lg opacity-0 transition-opacity duration-75";
 pathTooltip.style.left = "0px";
 pathTooltip.style.top = "0px";
 document.body.appendChild(pathTooltip);
@@ -357,7 +582,7 @@ function setBusy(nextBusy: boolean) {
   beforeList.querySelectorAll<HTMLButtonElement>(".before-remove-button").forEach((button) => {
     button.disabled = nextBusy;
   });
-  centerConvertButton.disabled = nextBusy || getBeforeFileCount() === 0;
+  centerConvertButton.disabled = nextBusy || !hasBeforeConvertibleFiles();
   centerRefreshButton.disabled = nextBusy || (state.beforeItems.length === 0 && state.results.length === 0);
 }
 
@@ -489,14 +714,24 @@ function escapeHtmlAttribute(value: string) {
     .replace(/>/g, "&gt;");
 }
 
+function escapeHtml(value: string) {
+  return value
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;");
+}
+
 function appendAfterItems(items: NormalizeResult[]) {
-  const existing = new Set(state.results.map((item) => item.outputPath));
   for (const item of items) {
-    if (existing.has(item.outputPath)) {
+    const bySourceIndex = state.results.findIndex((entry) => entry.sourcePath === item.sourcePath);
+    if (bySourceIndex >= 0) {
+      state.results[bySourceIndex] = item;
+      continue;
+    }
+    if (state.results.some((entry) => entry.outputPath === item.outputPath)) {
       continue;
     }
     state.results.push(item);
-    existing.add(item.outputPath);
   }
 }
 
@@ -517,6 +752,26 @@ function updateListCounts() {
 
 function getBeforeFileCount() {
   return state.beforeItems.filter((item) => !item.isDirectory).length;
+}
+
+function hasBeforeConvertibleFiles() {
+  return state.beforeItems.some((item) => item.changed);
+}
+
+function getSelectedBeforeItems() {
+  return state.beforeItems.filter((item) => state.selectedBeforePaths.has(item.sourcePath));
+}
+
+function getSelectedBeforeConvertibleItems() {
+  return getSelectedBeforeItems().filter((item) => item.changed);
+}
+
+function getSelectedBeforeFileCount() {
+  return getSelectedBeforeItems().length;
+}
+
+function getSelectedBeforeConvertibleCount() {
+  return getSelectedBeforeConvertibleItems().length;
 }
 
 function getBeforeVisibleFileCount() {
@@ -548,6 +803,78 @@ function toggleOrSelectOutputPath(outputPath: string, append: boolean) {
 
   state.selectedOutputPaths.clear();
   state.selectedOutputPaths.add(outputPath);
+}
+
+function toggleOrSelectBeforePath(sourcePath: string, append: boolean) {
+  if (append) {
+    if (state.selectedBeforePaths.has(sourcePath)) {
+      state.selectedBeforePaths.delete(sourcePath);
+    } else {
+      state.selectedBeforePaths.add(sourcePath);
+    }
+    return;
+  }
+  state.selectedBeforePaths.clear();
+  state.selectedBeforePaths.add(sourcePath);
+}
+
+function applyCardSelectionClass(card: HTMLElement, selected: boolean) {
+  const unselectedClasses = (card.dataset.unselectedClass ?? "")
+    .split(" ")
+    .map((v) => v.trim())
+    .filter(Boolean);
+  if (selected) {
+    for (const className of unselectedClasses) {
+      card.classList.remove(className);
+    }
+    card.classList.add(...SELECTED_CARD_CLASSES);
+    return;
+  }
+  card.classList.remove(...SELECTED_CARD_CLASSES);
+  if (unselectedClasses.length > 0) {
+    card.classList.add(...unselectedClasses);
+  }
+}
+
+function refreshBeforeSelectionVisuals() {
+  beforeList.querySelectorAll<HTMLElement>(".before-card").forEach((card) => {
+    const sourcePath = card.dataset.sourcePath;
+    if (!sourcePath) {
+      return;
+    }
+    applyCardSelectionClass(card, state.selectedBeforePaths.has(sourcePath));
+  });
+  centerConvertButton.disabled = state.busy || !hasBeforeConvertibleFiles();
+}
+
+function refreshAfterSelectionVisuals() {
+  afterCardElementMap.forEach((card, outputPath) => {
+    const selected = state.selectedOutputPaths.has(outputPath);
+    applyCardSelectionClass(card, selected);
+    const meta = card.querySelector<HTMLElement>("[data-after-meta=\"true\"]");
+    if (meta) {
+      meta.classList.toggle("text-sky-700", selected);
+      meta.classList.toggle("text-stone-500", !selected);
+    }
+  });
+  updateSelectionCount();
+}
+
+function refreshAfterSelectionByPaths(paths: Iterable<string>) {
+  for (const outputPath of new Set(paths)) {
+    const card = afterCardElementMap.get(outputPath);
+    if (!card) {
+      continue;
+    }
+    const selected = state.selectedOutputPaths.has(outputPath);
+    applyCardSelectionClass(card, selected);
+    const meta = card.querySelector<HTMLElement>("[data-after-meta=\"true\"]");
+    if (meta) {
+      meta.classList.toggle("text-sky-700", selected);
+      meta.classList.toggle("text-stone-500", !selected);
+    }
+  }
+  updateSelectionCount();
 }
 
 function renderEmptyList(target: HTMLDivElement, message: string, showPickerButton = false) {
@@ -653,13 +980,27 @@ function getBeforeDropZoneElement() {
 
 let beforeDropZoneBound: HTMLElement | null = null;
 
+function isExternalFileDrag(event: DragEvent) {
+  const types = event.dataTransfer?.types;
+  if (!types) {
+    return false;
+  }
+  return Array.from(types).includes("Files");
+}
+
 function handleBeforeDragEnter(event: DragEvent) {
+  if (!isExternalFileDrag(event)) {
+    return;
+  }
   event.preventDefault();
   state.beforeDragDepth += 1;
   setBeforeDropActive(true);
 }
 
 function handleBeforeDragOver(event: DragEvent) {
+  if (!isExternalFileDrag(event)) {
+    return;
+  }
   event.preventDefault();
   if (event.dataTransfer) {
     event.dataTransfer.dropEffect = "copy";
@@ -668,6 +1009,9 @@ function handleBeforeDragOver(event: DragEvent) {
 }
 
 function handleBeforeDragLeave(event: DragEvent) {
+  if (!isExternalFileDrag(event)) {
+    return;
+  }
   event.preventDefault();
   state.beforeDragDepth = Math.max(0, state.beforeDragDepth - 1);
   if (state.beforeDragDepth === 0) {
@@ -676,6 +1020,9 @@ function handleBeforeDragLeave(event: DragEvent) {
 }
 
 function handleBeforeDrop(event: DragEvent) {
+  if (!isExternalFileDrag(event)) {
+    return;
+  }
   event.preventDefault();
   state.beforeDragDepth = 0;
   setBeforeDropActive(false);
@@ -707,13 +1054,19 @@ function bindBeforeDropZoneEvents() {
 }
 
 function renderLists() {
+  const existingBeforePaths = new Set(state.beforeItems.map((item) => item.sourcePath));
+  state.selectedBeforePaths.forEach((sourcePath) => {
+    if (!existingBeforePaths.has(sourcePath)) {
+      state.selectedBeforePaths.delete(sourcePath);
+    }
+  });
   updateListCounts();
   updateSelectionCount();
   beforeFilterToggleButton.setAttribute("aria-pressed", state.beforeNfdOnly ? "true" : "false");
   beforeFilterTogglePill.classList.toggle("bg-sky-500", state.beforeNfdOnly);
   beforeFilterTogglePill.classList.toggle("bg-stone-300", !state.beforeNfdOnly);
   beforeFilterToggleKnob.classList.toggle("translate-x-4", state.beforeNfdOnly);
-  centerConvertButton.disabled = state.busy || getBeforeFileCount() === 0;
+  centerConvertButton.disabled = state.busy || !hasBeforeConvertibleFiles();
   centerRefreshButton.disabled = state.busy || (state.beforeItems.length === 0 && state.results.length === 0);
 
   const beforeVisibleEntries = state.beforeItems
@@ -737,14 +1090,19 @@ function renderLists() {
     beforeList.className = LIST_CLASS;
     beforeList.innerHTML = beforeVisibleEntries
     .map(({ item, originalIndex }, displayIndex) => {
+      const isSelected = state.selectedBeforePaths.has(item.sourcePath);
+      const selectedCardClass = isSelected
+        ? "border-sky-300 bg-sky-50 text-stone-900 shadow-md shadow-sky-100"
+        : "";
       if (item.isDirectory) {
         const currentFolderFileCount = state.beforeItems.filter(
           (entry) => !entry.isDirectory && isPathInFolderTree(entry.sourcePath, item.sourcePath)
         ).length;
         const folderPathDisplay = toCompactPath(getDirectoryPath(item.sourcePath));
         const folderPathTitle = escapeHtmlAttribute(item.sourcePath.normalize("NFC"));
+        const folderCardClass = isSelected ? selectedCardClass : "border-rose-200/80 bg-rose-100/70";
         return `
-        <article class="flex min-h-10 items-center gap-2 overflow-hidden rounded-xl border border-rose-200/80 bg-rose-100/70 px-2.5 py-1.5" data-path-tooltip="${folderPathTitle}">
+        <article class="before-card flex min-h-10 items-center gap-2 overflow-hidden rounded-xl border px-2.5 py-1.5 ${folderCardClass}" data-source-path="${item.sourcePath}" data-unselected-class="border-rose-200/80 bg-rose-100/70" data-path-tooltip="${folderPathTitle}">
           <span class="inline-flex min-w-7 shrink-0 items-center justify-center rounded-md border border-stone-200 bg-white px-1.5 py-0.5 text-[11px] font-semibold text-stone-500">
             ${displayIndex + 1}
           </span>
@@ -798,7 +1156,7 @@ function renderLists() {
           </svg>
         `;
       return `
-        <article class="flex min-h-10 items-center gap-2 overflow-hidden rounded-xl border px-2.5 py-1.5 ${beforeCardClass}" data-path-tooltip="${sourcePathTitle}">
+        <article class="before-card flex min-h-10 items-center gap-2 overflow-hidden rounded-xl border px-2.5 py-1.5 ${isSelected ? selectedCardClass : beforeCardClass}" data-source-path="${item.sourcePath}" data-unselected-class="${beforeCardClass}" data-path-tooltip="${sourcePathTitle}">
           <span class="inline-flex min-w-7 shrink-0 items-center justify-center rounded-md border border-stone-200 bg-white px-1.5 py-0.5 text-[11px] font-semibold text-stone-500">
             ${displayIndex + 1}
           </span>
@@ -844,6 +1202,11 @@ function renderLists() {
         }
         const targetItem = state.beforeItems[targetIndex];
         if (targetItem.isDirectory) {
+          state.selectedBeforePaths.forEach((sourcePath) => {
+            if (isPathInFolderTree(sourcePath, targetItem.sourcePath)) {
+              state.selectedBeforePaths.delete(sourcePath);
+            }
+          });
           state.beforeItems = state.beforeItems.filter(
             (item) => !isPathInFolderTree(item.sourcePath, targetItem.sourcePath)
           );
@@ -851,14 +1214,39 @@ function renderLists() {
           setStatus("폴더와 하위 파일 항목을 함께 삭제했습니다.", "success");
           return;
         }
+        state.selectedBeforePaths.delete(targetItem.sourcePath);
         state.beforeItems.splice(targetIndex, 1);
         renderLists();
         setStatus("원본 파일 목록 항목 1개를 삭제했습니다.", "success");
       });
     });
+
+    beforeList.querySelectorAll<HTMLElement>(".before-card").forEach((element) => {
+      element.addEventListener("click", (event) => {
+        const sourcePath = element.dataset.sourcePath;
+        if (!sourcePath) {
+          return;
+        }
+        const mouseEvent = event as MouseEvent;
+        toggleOrSelectBeforePath(sourcePath, mouseEvent.metaKey || mouseEvent.ctrlKey);
+        refreshBeforeSelectionVisuals();
+      });
+
+      element.addEventListener("dblclick", () => {
+        const sourcePath = element.dataset.sourcePath;
+        if (!sourcePath) {
+          return;
+        }
+        void window.desktopBridge.openItem(sourcePath).catch((error) => {
+          const message = error instanceof Error ? error.message : "항목을 열지 못했습니다.";
+          setStatus(message, "error");
+        });
+      });
+    });
   }
 
   if (state.results.length === 0) {
+    afterCardElementMap.clear();
     renderEmptyList(afterList, "변환된 파일 목록이 여기에 표시됩니다.");
   } else {
     afterList.className = LIST_CLASS;
@@ -867,7 +1255,6 @@ function renderLists() {
       const outputDisplayName = toWindowsPreviewAfter(item.outputName);
       const outputDirectoryPath = getDirectoryPath(item.outputPath);
       const outputCompactPath = toCompactPath(outputDirectoryPath);
-      const outputPathTitle = escapeHtmlAttribute(item.outputPath.normalize("NFC"));
       const isSelected = state.selectedOutputPaths.has(item.outputPath);
       const stateClasses = isSelected
         ? "border-sky-300 bg-sky-50 text-stone-900 shadow-md shadow-sky-100"
@@ -878,7 +1265,7 @@ function renderLists() {
         <article
           class="after-card flex min-h-10 w-full cursor-pointer items-center gap-2 overflow-hidden rounded-xl border px-2.5 py-1.5 transition ${stateClasses}"
           data-output-path="${item.outputPath}"
-          data-path-tooltip="${outputPathTitle}"
+          data-unselected-class="border-stone-200 bg-white text-stone-900"
         >
           <span class="inline-flex min-w-7 shrink-0 items-center justify-center rounded-md border border-stone-200 bg-white px-1.5 py-0.5 text-[11px] font-semibold text-stone-500">
             ${index + 1}
@@ -890,14 +1277,20 @@ function renderLists() {
           </span>
           <div class="min-w-0 flex-1">
             <p class="max-w-full truncate text-sm font-medium">${outputDisplayName}</p>
-            <p class="truncate text-[11px] ${metaTextClass}" data-path-tooltip="${outputPathTitle}">${outputCompactPath}</p>
+            <p class="truncate text-[11px] ${metaTextClass}" data-after-meta="true">${outputCompactPath}</p>
           </div>
         </article>
       `;
     })
     .join("");
 
+    afterCardElementMap.clear();
     afterList.querySelectorAll<HTMLElement>(".after-card").forEach((element) => {
+      const outputPath = element.dataset.outputPath;
+      if (outputPath) {
+        afterCardElementMap.set(outputPath, element);
+      }
+      element.setAttribute("draggable", "true");
       element.addEventListener("click", (event) => {
         const outputPath = element.dataset.outputPath;
         if (!outputPath) {
@@ -905,8 +1298,54 @@ function renderLists() {
         }
 
         const mouseEvent = event as MouseEvent;
-        toggleOrSelectOutputPath(outputPath, mouseEvent.metaKey || mouseEvent.ctrlKey);
-        renderLists();
+        if (mouseEvent.metaKey || mouseEvent.ctrlKey) {
+          toggleOrSelectOutputPath(outputPath, true);
+          refreshAfterSelectionByPaths([outputPath]);
+          return;
+        }
+        if (state.selectedOutputPaths.size === 1 && state.selectedOutputPaths.has(outputPath)) {
+          return;
+        }
+        const changedPaths = Array.from(state.selectedOutputPaths);
+        state.selectedOutputPaths.clear();
+        state.selectedOutputPaths.add(outputPath);
+        changedPaths.push(outputPath);
+        refreshAfterSelectionByPaths(changedPaths);
+      });
+
+      element.addEventListener("dblclick", () => {
+        const outputPath = element.dataset.outputPath;
+        if (!outputPath) {
+          return;
+        }
+        void window.desktopBridge.openItem(outputPath).catch((error) => {
+          const message = error instanceof Error ? error.message : "항목을 열지 못했습니다.";
+          setStatus(message, "error");
+        });
+      });
+
+      element.addEventListener("dragstart", (event) => {
+        event.preventDefault();
+        const outputPath = element.dataset.outputPath;
+        if (!outputPath) {
+          return;
+        }
+
+        if (!state.selectedOutputPaths.has(outputPath)) {
+          const changedPaths = Array.from(state.selectedOutputPaths);
+          state.selectedOutputPaths.clear();
+          state.selectedOutputPaths.add(outputPath);
+          changedPaths.push(outputPath);
+          refreshAfterSelectionByPaths(changedPaths);
+        }
+
+        const dragPaths = state.results
+          .map((item) => item.outputPath)
+          .filter((path) => state.selectedOutputPaths.has(path));
+        void window.desktopBridge.startFileDrag(dragPaths).catch((error) => {
+          const message = error instanceof Error ? error.message : "파일 드래그 시작에 실패했습니다.";
+          setStatus(message, "error");
+        });
       });
     });
   }
@@ -1002,13 +1441,13 @@ async function enqueuePaths(filePaths: string[]) {
   }
 }
 
-async function convertBeforeItems() {
+async function convertSourcePaths(sourcePaths: string[]) {
   if (state.busy) {
     return;
   }
-  const sourcePaths = state.beforeItems.filter((item) => !item.isDirectory).map((item) => item.sourcePath);
-  if (sourcePaths.length === 0) {
-    setStatus("먼저 변환할 파일을 원본 파일 목록에 추가해 주세요.", "error");
+  const uniqueSourcePaths = Array.from(new Set(sourcePaths));
+  if (uniqueSourcePaths.length === 0) {
+    setStatus("변환할 파일이 없습니다.", "error");
     return;
   }
   let unsubscribe: (() => void) | null = null;
@@ -1017,8 +1456,8 @@ async function convertBeforeItems() {
   try {
     setBusy(true);
     startProgressAnimation();
-    setProgress(0, sourcePaths.length);
-    setStatus(`${sourcePaths.length}개 파일을 변환 중입니다...`);
+    setProgress(0, uniqueSourcePaths.length);
+    setStatus(`${uniqueSourcePaths.length}개 항목을 변환 중입니다...`);
 
     unsubscribe = await window.desktopBridge.onNormalizeProgress((progress) => {
       setProgress(progress.processed, progress.total);
@@ -1032,13 +1471,41 @@ async function convertBeforeItems() {
       });
     });
 
-    const finalResults = await window.desktopBridge.normalizeFileNames(sourcePaths);
+    const finalResults = await window.desktopBridge.normalizeFileNames(uniqueSourcePaths);
     appendAfterItems(finalResults);
-    state.beforeItems = [];
+    const convertedSourcePathSet = new Set(uniqueSourcePaths);
+    const convertedDirectoryPaths = new Set(
+      state.beforeItems
+        .filter((item) => item.isDirectory && convertedSourcePathSet.has(item.sourcePath))
+        .map((item) => item.sourcePath)
+    );
+    state.beforeItems = state.beforeItems.filter((item) => {
+      if (convertedSourcePathSet.has(item.sourcePath)) {
+        return false;
+      }
+      for (const directoryPath of convertedDirectoryPaths) {
+        if (isPathInFolderTree(item.sourcePath, directoryPath)) {
+          return false;
+        }
+      }
+      return true;
+    });
+    state.selectedBeforePaths.forEach((sourcePath) => {
+      if (convertedSourcePathSet.has(sourcePath)) {
+        state.selectedBeforePaths.delete(sourcePath);
+        return;
+      }
+      for (const directoryPath of convertedDirectoryPaths) {
+        if (isPathInFolderTree(sourcePath, directoryPath)) {
+          state.selectedBeforePaths.delete(sourcePath);
+          return;
+        }
+      }
+    });
     state.selectedOutputPaths.clear();
     renderLists();
 
-    setProgress(sourcePaths.length, sourcePaths.length);
+    setProgress(uniqueSourcePaths.length, uniqueSourcePaths.length);
     const changedCount = finalResults.filter((item) => item.changed).length;
     setStatus(
       `${finalResults.length}개 출력 파일을 만들었습니다. ${changedCount}개는 NFD에서 NFC로 변경되었습니다.`,
@@ -1064,6 +1531,25 @@ async function convertBeforeItems() {
   }
 }
 
+async function convertBeforeItems() {
+  const selectedItems = getSelectedBeforeConvertibleItems();
+  const sourcePaths = selectedItems.map((item) => item.sourcePath);
+  if (sourcePaths.length === 0) {
+    setStatus("선택한 항목 중 변환 대상(NFD)이 없습니다.", "error");
+    return;
+  }
+  await convertSourcePaths(sourcePaths);
+}
+
+async function convertAllBeforeConvertibleItems() {
+  const sourcePaths = state.beforeItems.filter((item) => item.changed).map((item) => item.sourcePath);
+  if (sourcePaths.length === 0) {
+    setStatus("원본 파일 목록에 변환할 항목(NFD)이 없습니다.", "idle");
+    return;
+  }
+  await convertSourcePaths(sourcePaths);
+}
+
 function clearAllItems() {
   if (state.busy) {
     return;
@@ -1076,6 +1562,7 @@ function clearAllItems() {
   }
 
   state.beforeItems = [];
+  state.selectedBeforePaths.clear();
   state.results = [];
   state.selectedOutputPaths.clear();
   renderLists();
@@ -1137,10 +1624,13 @@ function formatErrorCodeMessage(errorCode?: string, errorMessage?: string) {
   return `에러코드: ${codeText}, 에러메시지: ${messageText}`;
 }
 
+function getSelectedResults() {
+  return state.results.filter((item) => state.selectedOutputPaths.has(item.outputPath));
+}
+
 async function copySelectedFiles() {
-  const selectedPaths = state.results
-    .map((item) => item.outputPath)
-    .filter((outputPath) => state.selectedOutputPaths.has(outputPath));
+  const selectedResults = getSelectedResults();
+  const selectedPaths = selectedResults.map((item) => item.outputPath);
   if (selectedPaths.length === 0) {
     setStatus("먼저 오른쪽 목록에서 복사할 파일을 선택해 주세요.", "error");
     return;
@@ -1170,6 +1660,7 @@ async function copySelectedFiles() {
         `${result.copiedCount}개 파일을 첨부용 클립보드에 복사했습니다. 텍스트 입력창에서는 비어 보일 수 있습니다.`,
         "success"
       );
+      showCopyToast(`파일 ${result.copiedCount}개 복사됨`, selectedResults.map((item) => item.outputName.normalize("NFC")));
       return;
     }
 
@@ -1200,9 +1691,8 @@ async function copySelectedFiles() {
 }
 
 async function copySelectedPathsAsText() {
-  const selectedPaths = state.results
-    .map((item) => item.outputPath)
-    .filter((outputPath) => state.selectedOutputPaths.has(outputPath));
+  const selectedResults = getSelectedResults();
+  const selectedPaths = selectedResults.map((item) => item.outputPath);
   if (selectedPaths.length === 0) {
     setStatus("먼저 오른쪽 목록에서 파일을 선택해 주세요.", "error");
     return;
@@ -1211,6 +1701,7 @@ async function copySelectedPathsAsText() {
   try {
     const result = await window.desktopBridge.copyPathTextToClipboard(selectedPaths);
     setStatus(`${result.copiedCount}개 파일 경로를 텍스트로 복사했습니다.`, "success");
+    showCopyToast(`경로 ${result.copiedCount}개 복사됨`, selectedResults.map((item) => item.outputName.normalize("NFC")));
   } catch (error) {
     const message = error instanceof Error ? error.message : "경로 텍스트 복사 중 오류가 발생했습니다.";
     setStatus(message, "error");
@@ -1221,12 +1712,21 @@ async function setupTauriFileDrop() {
   try {
     const { getCurrentWebviewWindow } = await import("@tauri-apps/api/webviewWindow");
     const webviewWindow = getCurrentWebviewWindow();
+    const isInsideBeforeDropZone = (position: { x: number; y: number }) => {
+      const dropZone = getBeforeDropZoneElement();
+      const rect = dropZone.getBoundingClientRect();
+      const clientX = position.x;
+      const clientY = position.y;
+      return clientX >= rect.left && clientX <= rect.right && clientY >= rect.top && clientY <= rect.bottom;
+    };
     await webviewWindow.onDragDropEvent((event) => {
       switch (event.payload.type) {
         case "enter":
-        case "over":
-          setBeforeDropActive(true);
+        case "over": {
+          const active = isInsideBeforeDropZone(event.payload.position);
+          setBeforeDropActive(active);
           break;
+        }
         case "leave":
         case "cancel":
           state.beforeDragDepth = 0;
@@ -1235,6 +1735,9 @@ async function setupTauriFileDrop() {
         case "drop": {
           state.beforeDragDepth = 0;
           setBeforeDropActive(false);
+          if (!isInsideBeforeDropZone(event.payload.position)) {
+            break;
+          }
           const paths = event.payload.paths ?? [];
           if (paths.length > 0) {
             void enqueuePaths(paths);
@@ -1250,6 +1753,12 @@ async function setupTauriFileDrop() {
 
 document.addEventListener("click", (event) => {
   const target = event.target as HTMLElement | null;
+  if (!target?.closest("#after-context-menu")) {
+    hideAfterContextMenu();
+  }
+  if (!target?.closest("#before-context-menu")) {
+    hideBeforeContextMenu();
+  }
   const pickerButton = target?.closest<HTMLButtonElement>("[data-before-picker]");
   if (!pickerButton) {
     return;
@@ -1263,7 +1772,7 @@ document.addEventListener("click", (event) => {
 });
 
 centerConvertButton.addEventListener("click", () => {
-  void convertBeforeItems();
+  void convertAllBeforeConvertibleItems();
 });
 
 centerRefreshButton.addEventListener("click", () => {
@@ -1273,6 +1782,10 @@ centerRefreshButton.addEventListener("click", () => {
 beforeFilterToggleButton.addEventListener("click", () => {
   state.beforeNfdOnly = !state.beforeNfdOnly;
   renderLists();
+});
+
+themeToggleButton.addEventListener("click", () => {
+  applyTheme(!state.darkMode, true);
 });
 
 copySelectionButton.addEventListener("click", () => {
@@ -1293,15 +1806,17 @@ selectAllAfterButton.addEventListener("click", () => {
   } else {
     state.selectedOutputPaths = new Set(state.results.map((item) => item.outputPath));
   }
-  renderLists();
+  refreshAfterSelectionVisuals();
 });
 
 beforeList.addEventListener("scroll", () => {
   updateScrollFadeState(beforeList);
+  hideBeforeContextMenu();
 });
 
 afterList.addEventListener("scroll", () => {
   updateScrollFadeState(afterList);
+  hideAfterContextMenu();
 });
 
 window.addEventListener("resize", () => {
@@ -1312,12 +1827,100 @@ window.addEventListener("keydown", (event) => {
   if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === "c") {
     if (state.selectedOutputPaths.size > 0) {
       event.preventDefault();
+      hideAfterContextMenu();
+      hideBeforeContextMenu();
       void copySelectedFiles();
     }
   }
 });
 
+afterList.addEventListener("contextmenu", (event) => {
+  event.preventDefault();
+  if (state.results.length === 0) {
+    hideAfterContextMenu();
+    return;
+  }
+  hideBeforeContextMenu();
+  const target = event.target as HTMLElement | null;
+  const card = target?.closest<HTMLElement>(".after-card");
+  if (card) {
+    const outputPath = card.dataset.outputPath;
+    if (outputPath && !state.selectedOutputPaths.has(outputPath)) {
+      const changedPaths = Array.from(state.selectedOutputPaths);
+      state.selectedOutputPaths.clear();
+      state.selectedOutputPaths.add(outputPath);
+      changedPaths.push(outputPath);
+      refreshAfterSelectionByPaths(changedPaths);
+    }
+  }
+  showAfterContextMenu(event.clientX, event.clientY);
+});
+
+afterContextCopyFilesButton.addEventListener("click", () => {
+  hideAfterContextMenu();
+  void copySelectedFiles();
+});
+
+afterContextSelectAllButton.addEventListener("click", () => {
+  hideAfterContextMenu();
+  if (state.results.length === 0) {
+    return;
+  }
+  state.selectedOutputPaths = new Set(state.results.map((item) => item.outputPath));
+  renderLists();
+  setStatus(`변환된 파일 목록 ${state.selectedOutputPaths.size}개를 전체 선택했습니다.`, "success");
+});
+
+afterContextCopyPathsButton.addEventListener("click", () => {
+  hideAfterContextMenu();
+  void copySelectedPathsAsText();
+});
+
+window.addEventListener("blur", () => {
+  hideAfterContextMenu();
+  hideBeforeContextMenu();
+});
+
+beforeList.addEventListener("contextmenu", (event) => {
+  event.preventDefault();
+  if (state.beforeItems.length === 0) {
+    hideBeforeContextMenu();
+    return;
+  }
+  hideAfterContextMenu();
+  const target = event.target as HTMLElement | null;
+  const card = target?.closest<HTMLElement>(".before-card");
+  if (card) {
+    const sourcePath = card.dataset.sourcePath;
+    if (sourcePath && !state.selectedBeforePaths.has(sourcePath)) {
+      state.selectedBeforePaths.clear();
+      state.selectedBeforePaths.add(sourcePath);
+      refreshBeforeSelectionVisuals();
+    }
+  }
+  showBeforeContextMenu(event.clientX, event.clientY);
+});
+
+beforeContextConvertButton.addEventListener("click", () => {
+  hideBeforeContextMenu();
+  void convertBeforeItems();
+});
+
+beforeContextClearButton.addEventListener("click", () => {
+  hideBeforeContextMenu();
+  if (state.busy || state.beforeItems.length === 0) {
+    return;
+  }
+  const beforeCount = state.beforeItems.length;
+  state.beforeItems = [];
+  state.selectedBeforePaths.clear();
+  renderLists();
+  setStatus(`원본 파일 목록 ${beforeCount}개를 전체 삭제했습니다.`, "success");
+});
+
 renderLists();
 updateScrollFades();
+initializeTheme();
+setupSystemThemeWatcher();
 void setupTauriFileDrop();
 appendStatusLog("앱이 준비되었습니다.");

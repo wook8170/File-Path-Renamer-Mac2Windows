@@ -13,6 +13,7 @@
     "tauri:build": "sh -c '. \"$HOME/.cargo/env\" && tauri build'"
   },
   "dependencies": {
+    "@crabnebula/tauri-plugin-drag": "^2.1.0",
     "@tauri-apps/api": "^2.10.1",
     "@tauri-apps/plugin-dialog": "^2.6.0",
     "pretendard": "^1.3.9"

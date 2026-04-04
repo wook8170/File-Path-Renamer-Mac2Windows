@@ -17,6 +17,10 @@
     font-family: "Pretendard", "Apple SD Gothic Neo", "Malgun Gothic", sans-serif;
   }
 
+  body.theme-dark {
+    color-scheme: dark;
+  }
+
   * {
     box-sizing: border-box;
   }
@@ -27,6 +31,10 @@
     background-image: none;
   }
 
+  body.theme-dark {
+    @apply bg-slate-900 text-slate-100;
+  }
+
   button,
   input {
     font: inherit;
@@ -34,6 +42,150 @@
 }
 
 @layer components {
+  body.theme-dark #top-section,
+  body.theme-dark #before-section,
+  body.theme-dark #after-section {
+    @apply border-slate-700/90 bg-slate-800/90;
+  }
+
+  body.theme-dark h1,
+  body.theme-dark h2 {
+    @apply text-slate-100;
+  }
+
+  body.theme-dark #status-log {
+    @apply border-slate-600 bg-slate-900 text-slate-300;
+  }
+
+  body.theme-dark #status-log .text-stone-600 {
+    @apply text-slate-200;
+  }
+
+  body.theme-dark #status-log .text-sky-700 {
+    @apply text-sky-300;
+  }
+
+  body.theme-dark #status-log .text-violet-700 {
+    @apply text-violet-300;
+  }
+
+  body.theme-dark #progress-label,
+  body.theme-dark #progress-percent,
+  body.theme-dark #before-count,
+  body.theme-dark #after-count {
+    @apply text-slate-400;
+  }
+
+  body.theme-dark #progress-track {
+    @apply bg-slate-700;
+  }
+
+  body.theme-dark #progress-bar {
+    @apply bg-sky-400;
+  }
+
+  body.theme-dark #theme-toggle,
+  body.theme-dark #before-filter-toggle,
+  body.theme-dark #select-all-after,
+  body.theme-dark #copy-paths,
+  body.theme-dark #copy-selection,
+  body.theme-dark #center-convert,
+  body.theme-dark #center-refresh {
+    @apply border-slate-600 bg-slate-700 text-slate-100;
+  }
+
+  body.theme-dark #theme-toggle:hover,
+  body.theme-dark #before-filter-toggle:hover,
+  body.theme-dark #select-all-after:hover,
+  body.theme-dark #copy-paths:hover,
+  body.theme-dark #copy-selection:hover,
+  body.theme-dark #center-convert:hover,
+  body.theme-dark #center-refresh:hover {
+    @apply border-slate-500 bg-slate-600;
+  }
+
+  body.theme-dark #copy-toast,
+  body.theme-dark #after-context-menu,
+  body.theme-dark #before-context-menu,
+  body.theme-dark .theme-path-tooltip {
+    @apply border-slate-600 bg-slate-800 text-slate-100;
+  }
+
+  body.theme-dark #after-context-menu button,
+  body.theme-dark #before-context-menu button {
+    @apply text-slate-100;
+  }
+
+  body.theme-dark #after-context-menu button:hover,
+  body.theme-dark #before-context-menu button:hover {
+    @apply bg-slate-700;
+  }
+
+  body.theme-dark #copy-toast-title {
+    @apply text-sky-300;
+  }
+
+  body.theme-dark #copy-toast-list {
+    @apply text-slate-200;
+  }
+
+  body.theme-dark .before-card:not(.border-sky-300),
+  body.theme-dark .after-card:not(.border-sky-300) {
+    @apply border-slate-600 bg-slate-800 text-slate-100;
+  }
+
+  body.theme-dark .before-card p.text-stone-800,
+  body.theme-dark .after-card p.text-stone-800 {
+    @apply text-slate-100;
+  }
+
+  body.theme-dark .before-card p.text-stone-400,
+  body.theme-dark .after-card p.text-stone-500,
+  body.theme-dark .after-card p.text-stone-400 {
+    @apply text-slate-300;
+  }
+
+  body.theme-dark .before-card.border-sky-300 p.text-stone-800,
+  body.theme-dark .after-card.border-sky-300 p.text-stone-800 {
+    @apply text-slate-100;
+  }
+
+  body.theme-dark .before-card.border-sky-300 p.text-stone-400,
+  body.theme-dark .after-card.border-sky-300 p.text-stone-500,
+  body.theme-dark .after-card.border-sky-300 p.text-stone-400 {
+    @apply text-sky-300;
+  }
+
+  body.theme-dark .before-card.border-sky-300,
+  body.theme-dark .after-card.border-sky-300 {
+    @apply border-sky-500 bg-sky-900/30 text-slate-100;
+  }
+
+  body.theme-dark .before-remove-button {
+    @apply text-slate-400 hover:text-slate-200;
+  }
+
+  body.theme-dark .scroll-fade {
+    background-color: rgba(15, 23, 42, 0.65);
+  }
+
+  body.theme-dark #before-list > div,
+  body.theme-dark #after-list > div {
+    @apply border-slate-600 bg-slate-800 text-slate-400;
+  }
+
+  body.theme-dark .status-idle {
+    @apply text-slate-400;
+  }
+
+  body.theme-dark .status-success {
+    @apply text-sky-300;
+  }
+
+  body.theme-dark .status-error {
+    @apply text-violet-300;
+  }
+
   .dropzone-active {
     @apply border-sky-400 bg-gradient-to-b from-sky-50 to-violet-50;
   }
@@ -82,6 +234,20 @@
   .file-drag-card {
     -webkit-user-drag: element;
     user-select: none;
+  }
+
+  .after-card,
+  .after-card * {
+    user-select: none;
+    -webkit-user-select: none;
+  }
+
+  #before-list,
+  #before-list *,
+  #after-list,
+  #after-list * {
+    user-select: none;
+    -webkit-user-select: none;
   }
 
   .scroll-fade {

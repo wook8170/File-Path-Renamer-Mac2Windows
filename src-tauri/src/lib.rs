@@ -170,17 +170,25 @@ fn normalize_file_names_sync(app: &tauri::AppHandle, file_paths: &[String]) -> R
     if file_paths.is_empty() {
         return Ok(vec![]);
     }
-    let mut results = Vec::with_capacity(file_paths.len());
+    let mut results: Vec<NormalizeResult> = Vec::with_capacity(file_paths.len());
     emit_progress(app, 0, file_paths.len());
 
-    for (index, source_path_text) in file_paths.iter().enumerate() {
-        let source_path = PathBuf::from(source_path_text);
+    let mut sorted_paths: Vec<PathBuf> = file_paths.iter().map(PathBuf::from).collect();
+    sorted_paths.sort_by(|a, b| {
+        let depth_a = a.components().count();
+        let depth_b = b.components().count();
+        depth_b.cmp(&depth_a)
+    });
+
+    for (index, source_path) in sorted_paths.iter().enumerate() {
+        let source_path = source_path.clone();
         let source_name = resolve_disk_base_name(&source_path);
         let normalized_name: String = source_name.nfc().collect();
         let source_normalization = normalize_type(&source_name);
         let needs_nfc_conversion = source_normalization != "NFC" && source_normalization != "BOTH";
         let mut output_path = source_path.clone();
         let mut collision_resolved = false;
+        let is_directory = fs::metadata(&source_path).map(|m| m.is_dir()).unwrap_or(false);
 
         if needs_nfc_conversion {
             let source_dir = source_path.parent().unwrap_or_else(|| Path::new("/"));
@@ -190,6 +198,23 @@ fn normalize_file_names_sync(app: &tauri::AppHandle, file_paths: &[String]) -> R
             collision_resolved = collision;
             if output_path != source_path {
                 fs::rename(&source_path, &output_path).map_err(|e| format!("파일명 변경 실패: {e}"))?;
+            }
+        }
+
+        if needs_nfc_conversion && is_directory && output_path != source_path {
+            let source_prefix = format!("{}/", source_path.to_string_lossy());
+            let output_prefix = format!("{}/", output_path.to_string_lossy());
+            for previous in results.iter_mut() {
+                if previous.output_path.starts_with(&source_prefix) {
+                    if let Some(suffix) = previous.output_path.strip_prefix(&source_prefix) {
+                        let updated_output_path = format!("{output_prefix}{suffix}");
+                        previous.output_path = updated_output_path.clone();
+                        previous.output_name = Path::new(&updated_output_path)
+                            .file_name()
+                            .map(|v| v.to_string_lossy().to_string())
+                            .unwrap_or_default();
+                    }
+                }
             }
         }
 
@@ -265,12 +290,13 @@ fn inspect_dir(
     seen.insert(normalized);
 
     let source_name = resolve_disk_base_name(dir_path);
+    let source_normalization = normalize_type(&source_name);
     let index = results.len();
     results.push(SourceInspectResult {
         source_path: dir_path.to_string_lossy().to_string(),
         source_name,
-        source_normalization: "BOTH".to_string(),
-        changed: false,
+        source_normalization: source_normalization.clone(),
+        changed: source_normalization != "NFC" && source_normalization != "BOTH",
         is_directory: true,
         folder_file_count: 0,
         parent_folder_path: parent_folder_path.clone(),
@@ -354,6 +380,15 @@ fn show_item_in_folder(file_path: String) -> Result<(), String> {
         .arg(file_path)
         .status()
         .map_err(|e| format!("Finder 열기 실패: {e}"))?;
+    Ok(())
+}
+
+#[tauri::command]
+fn open_item(file_path: String) -> Result<(), String> {
+    Command::new("open")
+        .arg(file_path)
+        .status()
+        .map_err(|e| format!("항목 열기 실패: {e}"))?;
     Ok(())
 }
 
@@ -456,6 +491,7 @@ fn copy_path_text_to_clipboard(file_paths: Vec<String>) -> Result<serde_json::Va
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
+        .plugin(tauri_plugin_drag::init())
         .setup(|app| {
             if cfg!(debug_assertions) {
                 app.handle().plugin(
@@ -469,6 +505,7 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             normalize_file_names,
             inspect_source_files,
+            open_item,
             show_item_in_folder,
             copy_files_to_clipboard,
             copy_path_text_to_clipboard
