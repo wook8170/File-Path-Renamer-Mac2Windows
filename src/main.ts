@@ -51,6 +51,7 @@ declare global {
       }>;
       copyPathTextToClipboard(filePaths: string[]): Promise<{ copiedCount: number }>;
       onInspectProgress(listener: (progress: InspectProgress) => void): Promise<() => void>;
+      onInspectBatch(listener: (items: BeforeItem[]) => void): Promise<() => void>;
       onNormalizeProgress(listener: (progress: NormalizeProgress) => void): Promise<() => void>;
       onNormalizeItem(listener: (item: NormalizeResult) => void): Promise<() => void>;
       startFileDrag(filePaths: string[]): Promise<void>;
@@ -72,6 +73,7 @@ const state = {
   progressPulseTimerId: 0,
   beforeDragDepth: 0,
   beforeDragHoverTimerId: 0,
+  afterInternalDragActive: false,
   busy: false,
   darkMode: false
 };
@@ -80,6 +82,11 @@ const LIST_CLASS =
   "scroll-fade relative grid content-start auto-rows-max h-[460px] max-h-[460px] min-h-[460px] gap-2 overflow-y-auto overflow-x-hidden pl-2 pr-4 py-2 [scrollbar-gutter:stable]";
 const LIST_CLASS_EMPTY =
   "scroll-fade relative grid content-start auto-rows-max h-[460px] max-h-[460px] min-h-[460px] gap-2 overflow-y-auto overflow-x-hidden pl-0 pr-0 py-0 [scrollbar-gutter:stable]";
+const LIST_CLASS_VIRTUAL =
+  "virtual-list-host scroll-fade relative h-[460px] max-h-[460px] min-h-[460px] overflow-y-auto overflow-x-hidden pl-2 pr-4 py-2 [scrollbar-gutter:stable]";
+const VIRTUAL_LIST_THRESHOLD = 300;
+const VIRTUAL_ROW_HEIGHT = 57;
+const VIRTUAL_OVERSCAN = 32;
 
 const app = document.querySelector<HTMLDivElement>("#app");
 
@@ -171,8 +178,8 @@ app.innerHTML = `
             aria-pressed="false"
           >
             <span class="text-[11px]">전체 보기</span>
-            <span id="before-filter-toggle-pill" class="inline-flex h-4 w-9 items-center rounded-full bg-stone-300 p-0.5 transition-colors">
-              <span id="before-filter-toggle-knob" class="h-3 w-3 rounded-full bg-white shadow-sm transition-transform"></span>
+            <span id="before-filter-toggle-pill" class="relative inline-flex h-4 w-9 rounded-full bg-stone-300 transition-colors">
+              <span id="before-filter-toggle-knob" class="absolute left-0.5 top-0.5 h-3 w-3 rounded-full bg-white shadow-sm transition-transform"></span>
             </span>
             <span id="before-filter-toggle-text" class="text-left text-[10px]">NFD만 보기</span>
           </button>
@@ -260,7 +267,7 @@ app.innerHTML = `
   </div>
   <div
     id="copy-toast"
-    class="pointer-events-none fixed bottom-3 right-3 z-[150] hidden w-[min(380px,calc(100vw-1.5rem))] rounded-xl border border-sky-200 bg-white p-3 shadow-lg"
+    class="pointer-events-none fixed bottom-3 right-3 z-[150] hidden w-[min(380px,calc(100vw-1.5rem))] rounded-xl border border-sky-200 bg-white p-3 shadow-[0_18px_42px_rgba(15,23,42,0.18),0_6px_16px_rgba(15,23,42,0.1)]"
     aria-live="polite"
   >
     <p id="copy-toast-title" class="text-xs font-semibold text-sky-700"></p>
@@ -361,8 +368,27 @@ if (
   throw new Error("Failed to initialize UI.");
 }
 
+beforeList.dataset.loadingLabel = "로딩중...";
+afterList.dataset.loadingLabel = "로딩중...";
+
 let copyToastTimerId = 0;
 const afterCardElementMap = new Map<string, HTMLElement>();
+const resultIndexBySourcePath = new Map<string, number>();
+const resultIndexByOutputPath = new Map<string, number>();
+const beforeRenderMetaCache = new Map<string, { displayName: string; compactPath: string; title: string }>();
+const afterRenderMetaCache = new Map<string, { displayName: string; compactPath: string }>();
+const pendingNormalizeItems: NormalizeResult[] = [];
+const pendingInspectItems: BeforeItem[] = [];
+let normalizeFlushRafId = 0;
+let inspectFlushTimerId = 0;
+let inspectOverlayRafId = 0;
+let latestInspectFileCount = 0;
+let beforeScrollRafId = 0;
+let afterScrollRafId = 0;
+let currentBeforeVisibleEntries: Array<{ item: BeforeItem; originalIndex: number }> = [];
+let currentAfterVisibleItems: NormalizeResult[] = [];
+let beforeVirtualLoadingTimerId = 0;
+let afterVirtualLoadingTimerId = 0;
 const THEME_STORAGE_KEY = "file-path-renamer-theme";
 const systemThemeMediaQuery = window.matchMedia("(prefers-color-scheme: dark)");
 
@@ -674,8 +700,8 @@ function toWindowsPreviewBefore(value: string, changed: boolean) {
   if (!changed) {
     return value.normalize("NFC");
   }
-
-  return Array.from(value.normalize("NFD")).join(" ");
+  return value.normalize("NFD");
+  //return Array.from(value.normalize("NFD")).join(" ");
 }
 
 function toWindowsPreviewAfter(value: string) {
@@ -722,17 +748,113 @@ function escapeHtml(value: string) {
 }
 
 function appendAfterItems(items: NormalizeResult[]) {
+  let changed = false;
   for (const item of items) {
-    const bySourceIndex = state.results.findIndex((entry) => entry.sourcePath === item.sourcePath);
-    if (bySourceIndex >= 0) {
+    const bySourceIndex = resultIndexBySourcePath.get(item.sourcePath);
+    if (bySourceIndex !== undefined) {
+      const previous = state.results[bySourceIndex];
+      if (previous.outputPath !== item.outputPath) {
+        resultIndexByOutputPath.delete(previous.outputPath);
+        afterRenderMetaCache.delete(previous.outputPath);
+      }
       state.results[bySourceIndex] = item;
+      resultIndexByOutputPath.set(item.outputPath, bySourceIndex);
+      changed = true;
       continue;
     }
-    if (state.results.some((entry) => entry.outputPath === item.outputPath)) {
+    if (resultIndexByOutputPath.has(item.outputPath)) {
       continue;
     }
+    const index = state.results.length;
     state.results.push(item);
+    resultIndexBySourcePath.set(item.sourcePath, index);
+    resultIndexByOutputPath.set(item.outputPath, index);
+    changed = true;
   }
+  return changed;
+}
+
+function consumePendingNormalizeItems() {
+  if (pendingNormalizeItems.length === 0) {
+    return false;
+  }
+  const items = pendingNormalizeItems.splice(0, pendingNormalizeItems.length);
+  return appendAfterItems(items);
+}
+
+function scheduleNormalizeListFlush() {
+  if (normalizeFlushRafId !== 0) {
+    return;
+  }
+  normalizeFlushRafId = window.requestAnimationFrame(() => {
+    normalizeFlushRafId = 0;
+    const changed = consumePendingNormalizeItems();
+    if (!changed) {
+      return;
+    }
+    renderLists();
+    window.requestAnimationFrame(() => {
+      updateScrollFadeState(afterList);
+    });
+  });
+}
+
+function enqueueNormalizeItem(item: NormalizeResult) {
+  pendingNormalizeItems.push(item);
+  scheduleNormalizeListFlush();
+}
+
+function scheduleInspectOverlay(fileCount: number) {
+  latestInspectFileCount = fileCount;
+  if (inspectOverlayRafId !== 0) {
+    return;
+  }
+  inspectOverlayRafId = window.requestAnimationFrame(() => {
+    inspectOverlayRafId = 0;
+    setBeforeListLoadingOverlay(true, `파일 목록 추가중... (파일 ${latestInspectFileCount}개)`);
+  });
+}
+
+function flushPendingInspectItems(existingPaths: Set<string>, addedPaths?: Set<string>) {
+  if (pendingInspectItems.length === 0) {
+    return false;
+  }
+
+  const incomingItems = pendingInspectItems.splice(0, pendingInspectItems.length);
+  let changed = false;
+
+  for (const item of incomingItems) {
+    if (existingPaths.has(item.sourcePath)) {
+      continue;
+    }
+    existingPaths.add(item.sourcePath);
+    addedPaths?.add(item.sourcePath);
+    state.beforeItems.push(item);
+    beforeRenderMetaCache.delete(item.sourcePath);
+    changed = true;
+  }
+
+  if (changed) {
+    recalculateFolderFileCounts();
+    renderLists();
+  }
+  return changed;
+}
+
+function scheduleInspectItemFlush(existingPaths: Set<string>, addedPaths?: Set<string>) {
+  if (inspectFlushTimerId !== 0) {
+    return;
+  }
+  inspectFlushTimerId = window.setTimeout(() => {
+    inspectFlushTimerId = 0;
+    const changed = flushPendingInspectItems(existingPaths, addedPaths);
+    if (!changed) {
+      return;
+    }
+    window.requestAnimationFrame(() => {
+      updateScrollFadeState(beforeList);
+    });
+  }, 12);
 }
 
 function updateSelectionCount() {
@@ -789,6 +911,261 @@ function isPathInFolderTree(targetPath: string, folderPath: string) {
   const normalizedTarget = normalizePathForCompare(targetPath);
   const normalizedFolder = normalizePathForCompare(folderPath);
   return normalizedTarget === normalizedFolder || normalizedTarget.startsWith(`${normalizedFolder}/`);
+}
+
+function recalculateFolderFileCounts() {
+  const directoryMap = new Map<string, BeforeItem>();
+  for (const item of state.beforeItems) {
+    if (item.isDirectory) {
+      item.folderFileCount = 0;
+      directoryMap.set(item.sourcePath, item);
+    }
+  }
+  for (const item of state.beforeItems) {
+    if (item.isDirectory) {
+      continue;
+    }
+    let currentParent = item.parentFolderPath;
+    while (currentParent) {
+      const parent = directoryMap.get(currentParent);
+      if (!parent) {
+        break;
+      }
+      parent.folderFileCount += 1;
+      currentParent = parent.parentFolderPath;
+    }
+  }
+}
+
+function getBeforeRenderMeta(item: BeforeItem, isNfd: boolean) {
+  const cacheKey = item.sourcePath;
+  const cached = beforeRenderMetaCache.get(cacheKey);
+  if (cached) {
+    return cached;
+  }
+  const meta = {
+    displayName: toWindowsPreviewBefore(item.sourceName, isNfd),
+    compactPath: toCompactPath(getDirectoryPath(item.sourcePath)),
+    title: escapeHtmlAttribute(item.sourcePath.normalize("NFC"))
+  };
+  beforeRenderMetaCache.set(cacheKey, meta);
+  return meta;
+}
+
+function getAfterRenderMeta(item: NormalizeResult) {
+  const cacheKey = item.outputPath;
+  const cached = afterRenderMetaCache.get(cacheKey);
+  if (cached) {
+    return cached;
+  }
+  const meta = {
+    displayName: toWindowsPreviewAfter(item.outputName),
+    compactPath: toCompactPath(getDirectoryPath(item.outputPath))
+  };
+  afterRenderMetaCache.set(cacheKey, meta);
+  return meta;
+}
+
+function getVirtualRange(scrollTop: number, itemCount: number) {
+  const viewportHeight = 460;
+  const startIndex = Math.max(0, Math.floor(scrollTop / VIRTUAL_ROW_HEIGHT) - VIRTUAL_OVERSCAN);
+  const visibleCount = Math.ceil(viewportHeight / VIRTUAL_ROW_HEIGHT) + VIRTUAL_OVERSCAN * 2;
+  const endIndex = Math.min(itemCount, startIndex + visibleCount);
+  return { startIndex, endIndex };
+}
+
+function renderBeforeCard(entry: { item: BeforeItem; originalIndex: number }, displayIndex: number) {
+  const { item, originalIndex } = entry;
+  const isSelected = state.selectedBeforePaths.has(item.sourcePath);
+  const selectedCardClass = isSelected ? "border-sky-300 bg-sky-50 text-stone-900 shadow-md shadow-sky-100" : "";
+  if (item.isDirectory) {
+    const folderPathDisplay = toCompactPath(getDirectoryPath(item.sourcePath));
+    const folderPathTitle = escapeHtmlAttribute(item.sourcePath.normalize("NFC"));
+    const folderCardClass = isSelected ? selectedCardClass : "border-rose-200/80 bg-rose-100/70";
+    return `
+      <article class="before-card flex min-h-10 items-center gap-2 overflow-hidden rounded-xl border px-2.5 py-1.5 ${folderCardClass}" data-source-path="${item.sourcePath}" data-unselected-class="border-rose-200/80 bg-rose-100/70" data-path-tooltip="${folderPathTitle}">
+        <span class="inline-flex min-w-7 shrink-0 items-center justify-center rounded-md border border-stone-200 bg-white px-1.5 py-0.5 text-[11px] font-semibold text-stone-500">
+          ${displayIndex + 1}
+        </span>
+        <span class="inline-flex h-6 w-6 shrink-0 items-center justify-center rounded-full border border-rose-300 bg-rose-200 text-rose-800">
+          <svg viewBox="0 0 20 20" aria-hidden="true" class="h-3.5 w-3.5 fill-current">
+            <path d="M2.5 5.5a2 2 0 0 1 2-2h3.2a1.4 1.4 0 0 1 1.1.5l.8 1h5.9a2 2 0 0 1 2 2v.6H2.5v-2.1Zm0 3.6h15v5.4a2 2 0 0 1-2 2h-11a2 2 0 0 1-2-2V9.1Z" />
+          </svg>
+        </span>
+        <div class="min-w-0 flex-1">
+          <p class="max-w-full overflow-hidden text-ellipsis whitespace-nowrap text-sm font-medium text-stone-800">${item.sourceName.normalize("NFC")}</p>
+          <p class="truncate text-[11px] text-stone-400" data-path-tooltip="${folderPathTitle}">폴더(${item.folderFileCount}개): ${folderPathDisplay}</p>
+        </div>
+        <button
+          class="before-remove-button ml-auto inline-flex h-5 w-5 shrink-0 items-center justify-center bg-transparent text-stone-500 transition hover:text-stone-800 disabled:cursor-not-allowed disabled:opacity-40"
+          data-before-index="${originalIndex}"
+          type="button"
+          aria-label="before 항목 삭제"
+          title="삭제"
+          ${state.busy ? "disabled" : ""}
+        >
+          <svg viewBox="0 0 20 20" aria-hidden="true" class="h-3.5 w-3.5 fill-none stroke-current stroke-[2]">
+            <path d="M5.5 5.5 14.5 14.5" stroke-linecap="round" />
+            <path d="M14.5 5.5 5.5 14.5" stroke-linecap="round" />
+          </svg>
+        </button>
+      </article>
+    `;
+  }
+
+  const isNfd = item.sourceNormalization === "NFD" || item.sourceNormalization === "MIXED";
+  const sourceMeta = getBeforeRenderMeta(item, isNfd);
+  const beforeCardClass = isNfd ? "border-stone-200 bg-white" : "border-stone-200 bg-stone-50";
+  const inChipClass = isNfd ? "bg-violet-100 text-violet-700" : "bg-stone-200 text-stone-500";
+  const inChipIcon = isNfd
+    ? `
+      <svg viewBox="0 0 20 20" aria-hidden="true" class="h-3.5 w-3.5 fill-current">
+        <path d="M12.8 9.8c0-1.7.9-2.8 2.2-3.5-.8-1.2-2.1-1.8-3.4-1.9-1.4-.1-2.4.7-3 .7-.7 0-1.6-.7-2.7-.6-2.2.1-4.2 1.8-4.2 4.9 0 1.2.2 2.5.8 3.8.8 1.7 2 3.5 3.6 3.4.9 0 1.5-.6 2.5-.6 1.1 0 1.6.6 2.6.6 1.5 0 2.6-1.7 3.3-3.3.4-.8.6-1.4.7-1.7-2-.8-2.4-2.7-2.4-3.8Z"/>
+        <path d="M11.7 3.1c.5-.6.9-1.5.8-2.3-.8.1-1.8.6-2.3 1.2-.5.6-.9 1.4-.8 2.2.9.1 1.8-.4 2.3-1.1Z"/>
+      </svg>
+    `
+    : `
+      <svg viewBox="0 0 20 20" aria-hidden="true" class="h-3.5 w-3.5 fill-current">
+        <path d="M2 3.2 9.2 2v7H2V3.2Zm8.8-1.5L18 0.8v8.1h-7.2V1.7ZM2 10.1h7.2V17L2 15.8v-5.7Zm8.8 0H18v8.1l-7.2-1.1v-7Z"/>
+      </svg>
+    `;
+  return `
+    <article class="before-card flex min-h-10 items-center gap-2 overflow-hidden rounded-xl border px-2.5 py-1.5 ${isSelected ? selectedCardClass : beforeCardClass}" data-source-path="${item.sourcePath}" data-unselected-class="${beforeCardClass}" data-path-tooltip="${sourceMeta.title}">
+      <span class="inline-flex min-w-7 shrink-0 items-center justify-center rounded-md border border-stone-200 bg-white px-1.5 py-0.5 text-[11px] font-semibold text-stone-500">
+        ${displayIndex + 1}
+      </span>
+      <span class="inline-flex h-6 w-6 shrink-0 items-center justify-center rounded-full ${inChipClass}">
+        ${inChipIcon}
+      </span>
+      <div class="min-w-0 flex-1">
+        <p class="max-w-full overflow-hidden text-ellipsis whitespace-nowrap text-sm font-medium text-stone-800">${sourceMeta.displayName}</p>
+        <p class="truncate text-[11px] text-stone-400" data-path-tooltip="${sourceMeta.title}">${sourceMeta.compactPath}</p>
+      </div>
+      <button
+        class="before-remove-button ml-auto inline-flex h-5 w-5 shrink-0 items-center justify-center bg-transparent text-stone-500 transition hover:text-stone-800 disabled:cursor-not-allowed disabled:opacity-40"
+        data-before-index="${originalIndex}"
+        type="button"
+        aria-label="before 항목 삭제"
+        title="삭제"
+        ${state.busy ? "disabled" : ""}
+      >
+        <svg viewBox="0 0 20 20" aria-hidden="true" class="h-3.5 w-3.5 fill-none stroke-current stroke-[2]">
+          <path d="M5.5 5.5 14.5 14.5" stroke-linecap="round" />
+          <path d="M14.5 5.5 5.5 14.5" stroke-linecap="round" />
+        </svg>
+      </button>
+    </article>
+  `;
+}
+
+function renderAfterCard(item: NormalizeResult, index: number) {
+  const outputMeta = getAfterRenderMeta(item);
+  const isSelected = state.selectedOutputPaths.has(item.outputPath);
+  const stateClasses = isSelected
+    ? "border-sky-300 bg-sky-50 text-stone-900 shadow-md shadow-sky-100"
+    : "border-stone-200 bg-stone-50";
+  const metaTextClass = isSelected ? "text-sky-700" : "text-stone-400";
+
+  return `
+    <article
+      class="after-card flex min-h-10 w-full cursor-pointer items-center gap-2 overflow-hidden rounded-xl border px-2.5 py-1.5 transition ${stateClasses}"
+      data-output-path="${item.outputPath}"
+      data-unselected-class="border-stone-200 bg-stone-50"
+    >
+      <span class="inline-flex min-w-7 shrink-0 items-center justify-center rounded-md border border-stone-200 bg-white px-1.5 py-0.5 text-[11px] font-semibold text-stone-500">
+        ${index + 1}
+      </span>
+      <span class="inline-flex h-6 w-6 shrink-0 items-center justify-center rounded-full bg-stone-200 text-stone-500">
+        <svg viewBox="0 0 20 20" aria-hidden="true" class="h-3.5 w-3.5 fill-current">
+          <path d="M2 3.2 9.2 2v7H2V3.2Zm8.8-1.5L18 0.8v8.1h-7.2V1.7ZM2 10.1h7.2V17L2 15.8v-5.7Zm8.8 0H18v8.1l-7.2-1.1v-7Z"/>
+        </svg>
+      </span>
+      <div class="min-w-0 flex-1">
+        <p class="max-w-full truncate text-sm font-medium text-stone-800">${outputMeta.displayName}</p>
+        <p class="truncate text-[11px] ${metaTextClass}" data-after-meta="true">${outputMeta.compactPath}</p>
+      </div>
+    </article>
+  `;
+}
+
+function renderVirtualBeforeList(entries: Array<{ item: BeforeItem; originalIndex: number }>) {
+  const scrollTop = beforeList.scrollTop;
+  const { startIndex, endIndex } = getVirtualRange(scrollTop, entries.length);
+  const totalHeight = entries.length * VIRTUAL_ROW_HEIGHT;
+  const visibleHtml = entries
+    .slice(startIndex, endIndex)
+    .map((entry, offset) => {
+      const actualIndex = startIndex + offset;
+      return `<div style="position:absolute;left:0;right:0;top:${actualIndex * VIRTUAL_ROW_HEIGHT}px;">${renderBeforeCard(entry, actualIndex)}</div>`;
+    })
+    .join("");
+
+  beforeList.className = LIST_CLASS_VIRTUAL;
+  beforeList.classList.remove("virtual-scroll-loading");
+  beforeList.dataset.loadingLabel = "로딩중...";
+  beforeList.innerHTML = `<div class="relative z-10" style="height:${totalHeight}px">${visibleHtml}</div>`;
+}
+
+function renderVirtualAfterList(items: NormalizeResult[]) {
+  const scrollTop = afterList.scrollTop;
+  const { startIndex, endIndex } = getVirtualRange(scrollTop, items.length);
+  const totalHeight = items.length * VIRTUAL_ROW_HEIGHT;
+  const visibleHtml = items
+    .slice(startIndex, endIndex)
+    .map((item, offset) => {
+      const actualIndex = startIndex + offset;
+      return `<div style="position:absolute;left:0;right:0;top:${actualIndex * VIRTUAL_ROW_HEIGHT}px;">${renderAfterCard(item, actualIndex)}</div>`;
+    })
+    .join("");
+
+  afterList.className = LIST_CLASS_VIRTUAL;
+  afterList.classList.remove("virtual-scroll-loading");
+  afterList.dataset.loadingLabel = "로딩중...";
+  afterList.innerHTML = `<div class="relative z-10" style="height:${totalHeight}px">${visibleHtml}</div>`;
+  afterCardElementMap.clear();
+  afterList.querySelectorAll<HTMLElement>(".after-card").forEach((element) => {
+    const outputPath = element.dataset.outputPath;
+    if (outputPath) {
+      afterCardElementMap.set(outputPath, element);
+    }
+    element.setAttribute("draggable", "true");
+  });
+}
+
+function showVirtualLoading(target: "before" | "after") {
+  const list = target === "before" ? beforeList : afterList;
+  const timerId = target === "before" ? beforeVirtualLoadingTimerId : afterVirtualLoadingTimerId;
+  if (timerId !== 0) {
+    return;
+  }
+  const nextTimerId = window.setTimeout(() => {
+    list.classList.add("virtual-scroll-loading");
+    if (target === "before") {
+      beforeVirtualLoadingTimerId = 0;
+      return;
+    }
+    afterVirtualLoadingTimerId = 0;
+  }, 32);
+
+  if (target === "before") {
+    beforeVirtualLoadingTimerId = nextTimerId;
+    return;
+  }
+  afterVirtualLoadingTimerId = nextTimerId;
+}
+
+function clearVirtualLoading(target: "before" | "after") {
+  const list = target === "before" ? beforeList : afterList;
+  const timerId = target === "before" ? beforeVirtualLoadingTimerId : afterVirtualLoadingTimerId;
+  if (timerId !== 0) {
+    window.clearTimeout(timerId);
+    if (target === "before") {
+      beforeVirtualLoadingTimerId = 0;
+    } else {
+      afterVirtualLoadingTimerId = 0;
+    }
+  }
+  list.classList.remove("virtual-scroll-loading");
 }
 
 function toggleOrSelectOutputPath(outputPath: string, append: boolean) {
@@ -981,6 +1358,9 @@ function getBeforeDropZoneElement() {
 let beforeDropZoneBound: HTMLElement | null = null;
 
 function isExternalFileDrag(event: DragEvent) {
+  if (state.afterInternalDragActive) {
+    return false;
+  }
   const types = event.dataTransfer?.types;
   if (!types) {
     return false;
@@ -1065,7 +1445,7 @@ function renderLists() {
   beforeFilterToggleButton.setAttribute("aria-pressed", state.beforeNfdOnly ? "true" : "false");
   beforeFilterTogglePill.classList.toggle("bg-sky-500", state.beforeNfdOnly);
   beforeFilterTogglePill.classList.toggle("bg-stone-300", !state.beforeNfdOnly);
-  beforeFilterToggleKnob.classList.toggle("translate-x-4", state.beforeNfdOnly);
+  beforeFilterToggleKnob.classList.toggle("translate-x-5", state.beforeNfdOnly);
   centerConvertButton.disabled = state.busy || !hasBeforeConvertibleFiles();
   centerRefreshButton.disabled = state.busy || (state.beforeItems.length === 0 && state.results.length === 0);
 
@@ -1078,7 +1458,10 @@ function renderLists() {
       return !item.isDirectory && item.sourceNormalization === "NFD";
     });
 
+  currentBeforeVisibleEntries = beforeVisibleEntries;
+
   if (beforeVisibleEntries.length === 0) {
+    beforeList.dataset.largeList = "0";
     const emptyMessage =
       state.beforeItems.length === 0
         ? "원본 파일 목록이 여기에 표시됩니다."
@@ -1087,202 +1470,34 @@ function renderLists() {
           : "원본 파일 목록이 여기에 표시됩니다.";
     renderEmptyList(beforeList, emptyMessage, true);
   } else {
-    beforeList.className = LIST_CLASS;
-    beforeList.innerHTML = beforeVisibleEntries
-    .map(({ item, originalIndex }, displayIndex) => {
-      const isSelected = state.selectedBeforePaths.has(item.sourcePath);
-      const selectedCardClass = isSelected
-        ? "border-sky-300 bg-sky-50 text-stone-900 shadow-md shadow-sky-100"
-        : "";
-      if (item.isDirectory) {
-        const currentFolderFileCount = state.beforeItems.filter(
-          (entry) => !entry.isDirectory && isPathInFolderTree(entry.sourcePath, item.sourcePath)
-        ).length;
-        const folderPathDisplay = toCompactPath(getDirectoryPath(item.sourcePath));
-        const folderPathTitle = escapeHtmlAttribute(item.sourcePath.normalize("NFC"));
-        const folderCardClass = isSelected ? selectedCardClass : "border-rose-200/80 bg-rose-100/70";
-        return `
-        <article class="before-card flex min-h-10 items-center gap-2 overflow-hidden rounded-xl border px-2.5 py-1.5 ${folderCardClass}" data-source-path="${item.sourcePath}" data-unselected-class="border-rose-200/80 bg-rose-100/70" data-path-tooltip="${folderPathTitle}">
-          <span class="inline-flex min-w-7 shrink-0 items-center justify-center rounded-md border border-stone-200 bg-white px-1.5 py-0.5 text-[11px] font-semibold text-stone-500">
-            ${displayIndex + 1}
-          </span>
-          <span class="inline-flex h-6 w-6 shrink-0 items-center justify-center rounded-full border border-rose-300 bg-rose-200 text-rose-800">
-            <svg viewBox="0 0 20 20" aria-hidden="true" class="h-3.5 w-3.5 fill-current">
-              <path d="M2.5 5.5a2 2 0 0 1 2-2h3.2a1.4 1.4 0 0 1 1.1.5l.8 1h5.9a2 2 0 0 1 2 2v.6H2.5v-2.1Zm0 3.6h15v5.4a2 2 0 0 1-2 2h-11a2 2 0 0 1-2-2V9.1Z" />
-            </svg>
-          </span>
-          <div class="min-w-0 flex-1">
-            <p class="max-w-full overflow-hidden text-ellipsis whitespace-nowrap text-sm font-medium text-stone-800">${item.sourceName.normalize("NFC")}</p>
-            <p class="truncate text-[11px] text-stone-400" data-path-tooltip="${folderPathTitle}">폴더(${currentFolderFileCount}개): ${folderPathDisplay}</p>
-          </div>
-          <button
-            class="before-remove-button ml-auto inline-flex h-5 w-5 shrink-0 items-center justify-center bg-transparent text-stone-500 transition hover:text-stone-800 disabled:cursor-not-allowed disabled:opacity-40"
-            data-before-index="${originalIndex}"
-            type="button"
-            aria-label="before 항목 삭제"
-            title="삭제"
-            ${state.busy ? "disabled" : ""}
-          >
-            <svg viewBox="0 0 20 20" aria-hidden="true" class="h-3.5 w-3.5 fill-none stroke-current stroke-[2]">
-              <path d="M5.5 5.5 14.5 14.5" stroke-linecap="round" />
-              <path d="M14.5 5.5 5.5 14.5" stroke-linecap="round" />
-            </svg>
-          </button>
-        </article>
-      `;
-      }
-
-      const isNfd = item.sourceNormalization === "NFD" || item.sourceNormalization === "MIXED";
-      const sourceDisplayName = toWindowsPreviewBefore(item.sourceName, isNfd);
-      const sourceDirectoryPath = getDirectoryPath(item.sourcePath);
-      const sourceCompactPath = toCompactPath(sourceDirectoryPath);
-      const sourcePathTitle = escapeHtmlAttribute(item.sourcePath.normalize("NFC"));
-      const beforeCardClass = isNfd
-        ? "border-stone-200 bg-white"
-        : "border-stone-200 bg-stone-50";
-      const inChipClass = isNfd
-        ? "bg-violet-100 text-violet-700"
-        : "bg-stone-200 text-stone-500";
-      const inChipIcon = isNfd
-        ? `
-          <svg viewBox="0 0 20 20" aria-hidden="true" class="h-3.5 w-3.5 fill-current">
-            <path d="M12.8 9.8c0-1.7.9-2.8 2.2-3.5-.8-1.2-2.1-1.8-3.4-1.9-1.4-.1-2.4.7-3 .7-.7 0-1.6-.7-2.7-.6-2.2.1-4.2 1.8-4.2 4.9 0 1.2.2 2.5.8 3.8.8 1.7 2 3.5 3.6 3.4.9 0 1.5-.6 2.5-.6 1.1 0 1.6.6 2.6.6 1.5 0 2.6-1.7 3.3-3.3.4-.8.6-1.4.7-1.7-2-.8-2.4-2.7-2.4-3.8Z"/>
-            <path d="M11.7 3.1c.5-.6.9-1.5.8-2.3-.8.1-1.8.6-2.3 1.2-.5.6-.9 1.4-.8 2.2.9.1 1.8-.4 2.3-1.1Z"/>
-          </svg>
-        `
-        : `
-          <svg viewBox="0 0 20 20" aria-hidden="true" class="h-3.5 w-3.5 fill-current">
-            <path d="M2 3.2 9.2 2v7H2V3.2Zm8.8-1.5L18 0.8v8.1h-7.2V1.7ZM2 10.1h7.2V17L2 15.8v-5.7Zm8.8 0H18v8.1l-7.2-1.1v-7Z"/>
-          </svg>
-        `;
-      return `
-        <article class="before-card flex min-h-10 items-center gap-2 overflow-hidden rounded-xl border px-2.5 py-1.5 ${isSelected ? selectedCardClass : beforeCardClass}" data-source-path="${item.sourcePath}" data-unselected-class="${beforeCardClass}" data-path-tooltip="${sourcePathTitle}">
-          <span class="inline-flex min-w-7 shrink-0 items-center justify-center rounded-md border border-stone-200 bg-white px-1.5 py-0.5 text-[11px] font-semibold text-stone-500">
-            ${displayIndex + 1}
-          </span>
-          <span class="inline-flex h-6 w-6 shrink-0 items-center justify-center rounded-full ${inChipClass}">
-            ${inChipIcon}
-          </span>
-          <div class="min-w-0 flex-1">
-            <p class="max-w-full overflow-hidden text-ellipsis whitespace-nowrap text-sm font-medium text-stone-800">${sourceDisplayName}</p>
-            <p class="truncate text-[11px] text-stone-400" data-path-tooltip="${sourcePathTitle}">${sourceCompactPath}</p>
-          </div>
-          <button
-            class="before-remove-button ml-auto inline-flex h-5 w-5 shrink-0 items-center justify-center bg-transparent text-stone-500 transition hover:text-stone-800 disabled:cursor-not-allowed disabled:opacity-40"
-            data-before-index="${originalIndex}"
-            type="button"
-            aria-label="before 항목 삭제"
-            title="삭제"
-            ${state.busy ? "disabled" : ""}
-          >
-            <svg viewBox="0 0 20 20" aria-hidden="true" class="h-3.5 w-3.5 fill-none stroke-current stroke-[2]">
-              <path d="M5.5 5.5 14.5 14.5" stroke-linecap="round" />
-              <path d="M14.5 5.5 5.5 14.5" stroke-linecap="round" />
-            </svg>
-          </button>
-        </article>
-      `;
-    })
-    .join("");
-
-    beforeList.querySelectorAll<HTMLButtonElement>(".before-remove-button").forEach((button) => {
-      button.addEventListener("click", (event) => {
-        event.preventDefault();
-        event.stopPropagation();
-        if (state.busy) {
-          return;
-        }
-        const indexText = button.dataset.beforeIndex;
-        if (indexText === undefined) {
-          return;
-        }
-        const targetIndex = Number.parseInt(indexText, 10);
-        if (!Number.isFinite(targetIndex) || targetIndex < 0 || targetIndex >= state.beforeItems.length) {
-          return;
-        }
-        const targetItem = state.beforeItems[targetIndex];
-        if (targetItem.isDirectory) {
-          state.selectedBeforePaths.forEach((sourcePath) => {
-            if (isPathInFolderTree(sourcePath, targetItem.sourcePath)) {
-              state.selectedBeforePaths.delete(sourcePath);
-            }
-          });
-          state.beforeItems = state.beforeItems.filter(
-            (item) => !isPathInFolderTree(item.sourcePath, targetItem.sourcePath)
-          );
-          renderLists();
-          setStatus("폴더와 하위 파일 항목을 함께 삭제했습니다.", "success");
-          return;
-        }
-        state.selectedBeforePaths.delete(targetItem.sourcePath);
-        state.beforeItems.splice(targetIndex, 1);
-        renderLists();
-        setStatus("원본 파일 목록 항목 1개를 삭제했습니다.", "success");
-      });
-    });
-
-    beforeList.querySelectorAll<HTMLElement>(".before-card").forEach((element) => {
-      element.addEventListener("click", (event) => {
-        const sourcePath = element.dataset.sourcePath;
-        if (!sourcePath) {
-          return;
-        }
-        const mouseEvent = event as MouseEvent;
-        toggleOrSelectBeforePath(sourcePath, mouseEvent.metaKey || mouseEvent.ctrlKey);
-        refreshBeforeSelectionVisuals();
-      });
-
-      element.addEventListener("dblclick", () => {
-        const sourcePath = element.dataset.sourcePath;
-        if (!sourcePath) {
-          return;
-        }
-        void window.desktopBridge.openItem(sourcePath).catch((error) => {
-          const message = error instanceof Error ? error.message : "항목을 열지 못했습니다.";
-          setStatus(message, "error");
-        });
-      });
-    });
+    beforeList.dataset.largeList = beforeVisibleEntries.length >= 1200 ? "1" : "0";
+    if (beforeVisibleEntries.length >= VIRTUAL_LIST_THRESHOLD) {
+      beforeList.dataset.virtualActive = "1";
+      renderVirtualBeforeList(beforeVisibleEntries);
+    } else {
+      beforeList.dataset.virtualActive = "0";
+      beforeList.className = LIST_CLASS;
+      beforeList.innerHTML = beforeVisibleEntries.map((entry, index) => renderBeforeCard(entry, index)).join("");
+    }
   }
 
+  currentAfterVisibleItems = state.results;
+
   if (state.results.length === 0) {
+    afterList.dataset.largeList = "0";
+    afterList.dataset.virtualActive = "0";
     afterCardElementMap.clear();
     renderEmptyList(afterList, "변환된 파일 목록이 여기에 표시됩니다.");
   } else {
-    afterList.className = LIST_CLASS;
-    afterList.innerHTML = state.results
-    .map((item, index) => {
-      const outputDisplayName = toWindowsPreviewAfter(item.outputName);
-      const outputDirectoryPath = getDirectoryPath(item.outputPath);
-      const outputCompactPath = toCompactPath(outputDirectoryPath);
-      const isSelected = state.selectedOutputPaths.has(item.outputPath);
-      const stateClasses = isSelected
-        ? "border-sky-300 bg-sky-50 text-stone-900 shadow-md shadow-sky-100"
-        : "border-stone-200 bg-white text-stone-900";
-      const metaTextClass = isSelected ? "text-sky-700" : "text-stone-500";
-
-      return `
-        <article
-          class="after-card flex min-h-10 w-full cursor-pointer items-center gap-2 overflow-hidden rounded-xl border px-2.5 py-1.5 transition ${stateClasses}"
-          data-output-path="${item.outputPath}"
-          data-unselected-class="border-stone-200 bg-white text-stone-900"
-        >
-          <span class="inline-flex min-w-7 shrink-0 items-center justify-center rounded-md border border-stone-200 bg-white px-1.5 py-0.5 text-[11px] font-semibold text-stone-500">
-            ${index + 1}
-          </span>
-          <span class="inline-flex h-6 w-6 shrink-0 items-center justify-center rounded-full bg-stone-200 text-stone-500">
-            <svg viewBox="0 0 20 20" aria-hidden="true" class="h-3.5 w-3.5 fill-current">
-              <path d="M2 3.2 9.2 2v7H2V3.2Zm8.8-1.5L18 0.8v8.1h-7.2V1.7ZM2 10.1h7.2V17L2 15.8v-5.7Zm8.8 0H18v8.1l-7.2-1.1v-7Z"/>
-            </svg>
-          </span>
-          <div class="min-w-0 flex-1">
-            <p class="max-w-full truncate text-sm font-medium">${outputDisplayName}</p>
-            <p class="truncate text-[11px] ${metaTextClass}" data-after-meta="true">${outputCompactPath}</p>
-          </div>
-        </article>
-      `;
-    })
-    .join("");
+    afterList.dataset.largeList = state.results.length >= 1200 ? "1" : "0";
+    if (state.results.length >= VIRTUAL_LIST_THRESHOLD) {
+      afterList.dataset.virtualActive = "1";
+      renderVirtualAfterList(state.results);
+    } else {
+      afterList.dataset.virtualActive = "0";
+      afterList.className = LIST_CLASS;
+      afterList.innerHTML = state.results.map((item, index) => renderAfterCard(item, index)).join("");
+    }
 
     afterCardElementMap.clear();
     afterList.querySelectorAll<HTMLElement>(".after-card").forEach((element) => {
@@ -1291,62 +1506,6 @@ function renderLists() {
         afterCardElementMap.set(outputPath, element);
       }
       element.setAttribute("draggable", "true");
-      element.addEventListener("click", (event) => {
-        const outputPath = element.dataset.outputPath;
-        if (!outputPath) {
-          return;
-        }
-
-        const mouseEvent = event as MouseEvent;
-        if (mouseEvent.metaKey || mouseEvent.ctrlKey) {
-          toggleOrSelectOutputPath(outputPath, true);
-          refreshAfterSelectionByPaths([outputPath]);
-          return;
-        }
-        if (state.selectedOutputPaths.size === 1 && state.selectedOutputPaths.has(outputPath)) {
-          return;
-        }
-        const changedPaths = Array.from(state.selectedOutputPaths);
-        state.selectedOutputPaths.clear();
-        state.selectedOutputPaths.add(outputPath);
-        changedPaths.push(outputPath);
-        refreshAfterSelectionByPaths(changedPaths);
-      });
-
-      element.addEventListener("dblclick", () => {
-        const outputPath = element.dataset.outputPath;
-        if (!outputPath) {
-          return;
-        }
-        void window.desktopBridge.openItem(outputPath).catch((error) => {
-          const message = error instanceof Error ? error.message : "항목을 열지 못했습니다.";
-          setStatus(message, "error");
-        });
-      });
-
-      element.addEventListener("dragstart", (event) => {
-        event.preventDefault();
-        const outputPath = element.dataset.outputPath;
-        if (!outputPath) {
-          return;
-        }
-
-        if (!state.selectedOutputPaths.has(outputPath)) {
-          const changedPaths = Array.from(state.selectedOutputPaths);
-          state.selectedOutputPaths.clear();
-          state.selectedOutputPaths.add(outputPath);
-          changedPaths.push(outputPath);
-          refreshAfterSelectionByPaths(changedPaths);
-        }
-
-        const dragPaths = state.results
-          .map((item) => item.outputPath)
-          .filter((path) => state.selectedOutputPaths.has(path));
-        void window.desktopBridge.startFileDrag(dragPaths).catch((error) => {
-          const message = error instanceof Error ? error.message : "파일 드래그 시작에 실패했습니다.";
-          setStatus(message, "error");
-        });
-      });
     });
   }
 
@@ -1361,6 +1520,13 @@ function scrollListsToBottom() {
 }
 
 function updateScrollFadeState(list: HTMLDivElement) {
+  const disableMaskForLargeList = list.dataset.largeList === "1";
+  list.classList.toggle("scroll-fade-disabled", disableMaskForLargeList);
+  if (disableMaskForLargeList) {
+    list.classList.remove("scroll-fade-enabled", "scroll-fade-top", "scroll-fade-bottom");
+    return;
+  }
+
   const maxScrollTop = Math.max(0, list.scrollHeight - list.clientHeight);
   const hasOverflow = maxScrollTop > 1;
   const hasTopOverflow = hasOverflow && list.scrollTop > 1;
@@ -1383,6 +1549,7 @@ async function enqueuePaths(filePaths: string[]) {
   }
 
   const existing = new Set(state.beforeItems.map((item) => item.sourcePath));
+  const addedDuringInspect = new Set<string>();
   const uniquePaths = filePaths.filter((filePath) => !existing.has(filePath));
   if (uniquePaths.length === 0) {
     setStatus("이미 원본 파일 목록에 있는 파일입니다.", "idle");
@@ -1393,34 +1560,49 @@ async function enqueuePaths(filePaths: string[]) {
   setBeforeListLoadingOverlay(true, "파일 목록 추가중... (파일 0개)");
   setStatus("폴더/파일 목록을 분석 중입니다...");
   let unsubscribeInspect: (() => void) | null = null;
+  let unsubscribeInspectBatch: (() => void) | null = null;
 
   try {
+    unsubscribeInspectBatch = await window.desktopBridge.onInspectBatch((items) => {
+      pendingInspectItems.push(...items);
+      scheduleInspectItemFlush(existing, addedDuringInspect);
+    });
     unsubscribeInspect = await window.desktopBridge.onInspectProgress((progress) => {
-      setBeforeListLoadingOverlay(true, `파일 목록 추가중... (파일 ${progress.fileCount}개)`);
+      scheduleInspectOverlay(progress.fileCount);
     });
     await waitNextPaint();
     const inspectedItems = await window.desktopBridge.inspectSourceFiles(uniquePaths);
-    const mergedItems = inspectedItems.filter((item) => {
+    if (inspectFlushTimerId !== 0) {
+      window.clearTimeout(inspectFlushTimerId);
+      inspectFlushTimerId = 0;
+    }
+    flushPendingInspectItems(existing, addedDuringInspect);
+    for (const item of inspectedItems) {
       if (existing.has(item.sourcePath)) {
-        return false;
+        continue;
       }
       existing.add(item.sourcePath);
-      return true;
-    });
-    if (mergedItems.length === 0) {
+      addedDuringInspect.add(item.sourcePath);
+      state.beforeItems.push(item);
+      beforeRenderMetaCache.delete(item.sourcePath);
+    }
+    const addedCount = addedDuringInspect.size;
+    if (addedCount === 0) {
       setStatus("이미 원본 파일 목록에 있는 항목입니다.", "idle");
       return;
     }
-    state.beforeItems.push(...mergedItems);
+    recalculateFolderFileCounts();
     renderLists();
     window.requestAnimationFrame(() => {
       beforeList.scrollTop = beforeList.scrollHeight;
       updateScrollFadeState(beforeList);
     });
 
-    const addedFolderCount = mergedItems.filter((item) => item.isDirectory).length;
-    const addedFileCount = mergedItems.length - addedFolderCount;
-    const skippedCount = inspectedItems.length - mergedItems.length + (filePaths.length - uniquePaths.length);
+    const addedFolderCount = state.beforeItems.filter(
+      (item) => addedDuringInspect.has(item.sourcePath) && item.isDirectory
+    ).length;
+    const addedFileCount = addedCount - addedFolderCount;
+    const skippedCount = inspectedItems.length - addedCount + (filePaths.length - uniquePaths.length);
     if (skippedCount > 0) {
       setStatus(
         `원본 파일 목록에 파일 ${addedFileCount}개, 폴더 ${addedFolderCount}개 추가 (${skippedCount}개 중복 제외)`,
@@ -1433,6 +1615,18 @@ async function enqueuePaths(filePaths: string[]) {
     const message = error instanceof Error ? error.message : "파일 정보를 확인하는 중 오류가 발생했습니다.";
     setStatus(message, "error");
   } finally {
+    if (inspectFlushTimerId !== 0) {
+      window.clearTimeout(inspectFlushTimerId);
+      inspectFlushTimerId = 0;
+    }
+    pendingInspectItems.length = 0;
+    if (inspectOverlayRafId !== 0) {
+      window.cancelAnimationFrame(inspectOverlayRafId);
+      inspectOverlayRafId = 0;
+    }
+    if (unsubscribeInspectBatch) {
+      unsubscribeInspectBatch();
+    }
     if (unsubscribeInspect) {
       unsubscribeInspect();
     }
@@ -1463,15 +1657,15 @@ async function convertSourcePaths(sourcePaths: string[]) {
       setProgress(progress.processed, progress.total);
     });
     unsubscribeItem = await window.desktopBridge.onNormalizeItem((item) => {
-      appendAfterItems([item]);
-      renderLists();
-      window.requestAnimationFrame(() => {
-        afterList.scrollTop = afterList.scrollHeight;
-        updateScrollFadeState(afterList);
-      });
+      enqueueNormalizeItem(item);
     });
 
     const finalResults = await window.desktopBridge.normalizeFileNames(uniqueSourcePaths);
+    if (normalizeFlushRafId !== 0) {
+      window.cancelAnimationFrame(normalizeFlushRafId);
+      normalizeFlushRafId = 0;
+    }
+    consumePendingNormalizeItems();
     appendAfterItems(finalResults);
     const convertedSourcePathSet = new Set(uniqueSourcePaths);
     const convertedDirectoryPaths = new Set(
@@ -1490,6 +1684,8 @@ async function convertSourcePaths(sourcePaths: string[]) {
       }
       return true;
     });
+    recalculateFolderFileCounts();
+    beforeRenderMetaCache.clear();
     state.selectedBeforePaths.forEach((sourcePath) => {
       if (convertedSourcePathSet.has(sourcePath)) {
         state.selectedBeforePaths.delete(sourcePath);
@@ -1504,6 +1700,10 @@ async function convertSourcePaths(sourcePaths: string[]) {
     });
     state.selectedOutputPaths.clear();
     renderLists();
+    window.requestAnimationFrame(() => {
+      afterList.scrollTop = afterList.scrollHeight;
+      updateScrollFadeState(afterList);
+    });
 
     setProgress(uniqueSourcePaths.length, uniqueSourcePaths.length);
     const changedCount = finalResults.filter((item) => item.changed).length;
@@ -1515,6 +1715,11 @@ async function convertSourcePaths(sourcePaths: string[]) {
     const message = error instanceof Error ? error.message : "알 수 없는 오류가 발생했습니다.";
     setStatus(message, "error");
   } finally {
+    if (normalizeFlushRafId !== 0) {
+      window.cancelAnimationFrame(normalizeFlushRafId);
+      normalizeFlushRafId = 0;
+    }
+    pendingNormalizeItems.length = 0;
     if (unsubscribe) {
       unsubscribe();
     }
@@ -1542,9 +1747,9 @@ async function convertBeforeItems() {
 }
 
 async function convertAllBeforeConvertibleItems() {
-  const sourcePaths = state.beforeItems.filter((item) => item.changed).map((item) => item.sourcePath);
+  const sourcePaths = state.beforeItems.map((item) => item.sourcePath);
   if (sourcePaths.length === 0) {
-    setStatus("원본 파일 목록에 변환할 항목(NFD)이 없습니다.", "idle");
+    setStatus("원본 파일 목록에 항목이 없습니다.", "idle");
     return;
   }
   await convertSourcePaths(sourcePaths);
@@ -1563,7 +1768,12 @@ function clearAllItems() {
 
   state.beforeItems = [];
   state.selectedBeforePaths.clear();
+  beforeRenderMetaCache.clear();
   state.results = [];
+  resultIndexBySourcePath.clear();
+  resultIndexByOutputPath.clear();
+  afterRenderMetaCache.clear();
+  pendingNormalizeItems.length = 0;
   state.selectedOutputPaths.clear();
   renderLists();
   setStatus(`원본 파일 목록 ${beforeCount}개, 변환된 파일 목록 ${afterCount}개를 초기화했습니다.`, "success");
@@ -1771,6 +1981,139 @@ document.addEventListener("click", (event) => {
   });
 });
 
+beforeList.addEventListener("click", (event) => {
+  const target = event.target as HTMLElement | null;
+  const removeButton = target?.closest<HTMLButtonElement>(".before-remove-button");
+  if (removeButton) {
+    event.preventDefault();
+    event.stopPropagation();
+    if (state.busy) {
+      return;
+    }
+    const indexText = removeButton.dataset.beforeIndex;
+    if (indexText === undefined) {
+      return;
+    }
+    const targetIndex = Number.parseInt(indexText, 10);
+    if (!Number.isFinite(targetIndex) || targetIndex < 0 || targetIndex >= state.beforeItems.length) {
+      return;
+    }
+    const targetItem = state.beforeItems[targetIndex];
+    if (targetItem.isDirectory) {
+      state.selectedBeforePaths.forEach((sourcePath) => {
+        if (isPathInFolderTree(sourcePath, targetItem.sourcePath)) {
+          state.selectedBeforePaths.delete(sourcePath);
+        }
+      });
+      state.beforeItems = state.beforeItems.filter((item) => !isPathInFolderTree(item.sourcePath, targetItem.sourcePath));
+      recalculateFolderFileCounts();
+      renderLists();
+      setStatus("폴더와 하위 파일 항목을 함께 삭제했습니다.", "success");
+      return;
+    }
+    state.selectedBeforePaths.delete(targetItem.sourcePath);
+    state.beforeItems.splice(targetIndex, 1);
+    recalculateFolderFileCounts();
+    renderLists();
+    setStatus("원본 파일 목록 항목 1개를 삭제했습니다.", "success");
+    return;
+  }
+
+  const card = target?.closest<HTMLElement>(".before-card");
+  if (!card) {
+    return;
+  }
+  const sourcePath = card.dataset.sourcePath;
+  if (!sourcePath) {
+    return;
+  }
+  const mouseEvent = event as MouseEvent;
+  toggleOrSelectBeforePath(sourcePath, mouseEvent.metaKey || mouseEvent.ctrlKey);
+  refreshBeforeSelectionVisuals();
+});
+
+beforeList.addEventListener("dblclick", (event) => {
+  const target = event.target as HTMLElement | null;
+  if (target?.closest(".before-remove-button")) {
+    return;
+  }
+  const card = target?.closest<HTMLElement>(".before-card");
+  const sourcePath = card?.dataset.sourcePath;
+  if (!sourcePath) {
+    return;
+  }
+  void window.desktopBridge.openItem(sourcePath).catch((error) => {
+    const message = error instanceof Error ? error.message : "항목을 열지 못했습니다.";
+    setStatus(message, "error");
+  });
+});
+
+afterList.addEventListener("click", (event) => {
+  const target = event.target as HTMLElement | null;
+  const card = target?.closest<HTMLElement>(".after-card");
+  const outputPath = card?.dataset.outputPath;
+  if (!outputPath) {
+    return;
+  }
+  const mouseEvent = event as MouseEvent;
+  if (mouseEvent.metaKey || mouseEvent.ctrlKey) {
+    toggleOrSelectOutputPath(outputPath, true);
+    refreshAfterSelectionByPaths([outputPath]);
+    return;
+  }
+  if (state.selectedOutputPaths.size === 1 && state.selectedOutputPaths.has(outputPath)) {
+    return;
+  }
+  const changedPaths = Array.from(state.selectedOutputPaths);
+  state.selectedOutputPaths.clear();
+  state.selectedOutputPaths.add(outputPath);
+  changedPaths.push(outputPath);
+  refreshAfterSelectionByPaths(changedPaths);
+});
+
+afterList.addEventListener("dblclick", (event) => {
+  const target = event.target as HTMLElement | null;
+  const card = target?.closest<HTMLElement>(".after-card");
+  const outputPath = card?.dataset.outputPath;
+  if (!outputPath) {
+    return;
+  }
+  void window.desktopBridge.openItem(outputPath).catch((error) => {
+    const message = error instanceof Error ? error.message : "항목을 열지 못했습니다.";
+    setStatus(message, "error");
+  });
+});
+
+afterList.addEventListener("dragstart", (event) => {
+  const dragEvent = event as DragEvent;
+  const target = dragEvent.target as HTMLElement | null;
+  const card = target?.closest<HTMLElement>(".after-card");
+  const outputPath = card?.dataset.outputPath;
+  if (!outputPath) {
+    return;
+  }
+
+  dragEvent.preventDefault();
+  if (!state.selectedOutputPaths.has(outputPath)) {
+    const changedPaths = Array.from(state.selectedOutputPaths);
+    state.selectedOutputPaths.clear();
+    state.selectedOutputPaths.add(outputPath);
+    changedPaths.push(outputPath);
+    refreshAfterSelectionByPaths(changedPaths);
+  }
+
+  state.afterInternalDragActive = true;
+  const dragPaths = state.results.map((item) => item.outputPath).filter((path) => state.selectedOutputPaths.has(path));
+  void window.desktopBridge.startFileDrag(dragPaths).catch((error) => {
+    const message = error instanceof Error ? error.message : "파일 드래그 시작에 실패했습니다.";
+    setStatus(message, "error");
+  });
+});
+
+afterList.addEventListener("dragend", () => {
+  state.afterInternalDragActive = false;
+});
+
 centerConvertButton.addEventListener("click", () => {
   void convertAllBeforeConvertibleItems();
 });
@@ -1810,16 +2153,46 @@ selectAllAfterButton.addEventListener("click", () => {
 });
 
 beforeList.addEventListener("scroll", () => {
-  updateScrollFadeState(beforeList);
+  if (beforeScrollRafId === 0) {
+    if (beforeList.dataset.virtualActive === "1") {
+      showVirtualLoading("before");
+    }
+    beforeScrollRafId = window.requestAnimationFrame(() => {
+      beforeScrollRafId = 0;
+      if (beforeList.dataset.virtualActive === "1") {
+        renderVirtualBeforeList(currentBeforeVisibleEntries);
+        clearVirtualLoading("before");
+      }
+      updateScrollFadeState(beforeList);
+    });
+  }
   hideBeforeContextMenu();
 });
 
 afterList.addEventListener("scroll", () => {
-  updateScrollFadeState(afterList);
+  if (afterScrollRafId === 0) {
+    if (afterList.dataset.virtualActive === "1") {
+      showVirtualLoading("after");
+    }
+    afterScrollRafId = window.requestAnimationFrame(() => {
+      afterScrollRafId = 0;
+      if (afterList.dataset.virtualActive === "1") {
+        renderVirtualAfterList(currentAfterVisibleItems);
+        clearVirtualLoading("after");
+      }
+      updateScrollFadeState(afterList);
+    });
+  }
   hideAfterContextMenu();
 });
 
 window.addEventListener("resize", () => {
+  if (beforeList.dataset.virtualActive === "1") {
+    renderVirtualBeforeList(currentBeforeVisibleEntries);
+  }
+  if (afterList.dataset.virtualActive === "1") {
+    renderVirtualAfterList(currentAfterVisibleItems);
+  }
   updateScrollFades();
 });
 
@@ -1867,7 +2240,7 @@ afterContextSelectAllButton.addEventListener("click", () => {
     return;
   }
   state.selectedOutputPaths = new Set(state.results.map((item) => item.outputPath));
-  renderLists();
+  refreshAfterSelectionVisuals();
   setStatus(`변환된 파일 목록 ${state.selectedOutputPaths.size}개를 전체 선택했습니다.`, "success");
 });
 
@@ -1914,6 +2287,7 @@ beforeContextClearButton.addEventListener("click", () => {
   const beforeCount = state.beforeItems.length;
   state.beforeItems = [];
   state.selectedBeforePaths.clear();
+  beforeRenderMetaCache.clear();
   renderLists();
   setStatus(`원본 파일 목록 ${beforeCount}개를 전체 삭제했습니다.`, "success");
 });

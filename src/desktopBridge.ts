@@ -54,6 +54,7 @@ export type DesktopBridge = {
   copyFilesToClipboard(filePaths: string[]): Promise<ClipboardCopyResult>;
   copyPathTextToClipboard(filePaths: string[]): Promise<{ copiedCount: number }>;
   onInspectProgress(listener: (progress: InspectProgress) => void): Promise<() => void>;
+  onInspectBatch(listener: (items: BeforeItem[]) => void): Promise<() => void>;
   onNormalizeProgress(listener: (progress: NormalizeProgress) => void): Promise<() => void>;
   onNormalizeItem(listener: (item: NormalizeResult) => void): Promise<() => void>;
   startFileDrag(filePaths: string[]): Promise<void>;
@@ -121,6 +122,14 @@ export const desktopBridge: DesktopBridge = {
   },
   async onInspectProgress(listener) {
     const unlisten = await listen<InspectProgress>("inspect-progress", (event) => {
+      listener(event.payload);
+    });
+    return () => {
+      unlisten();
+    };
+  },
+  async onInspectBatch(listener) {
+    const unlisten = await listen<BeforeItem[]>("inspect-batch", (event) => {
       listener(event.payload);
     });
     return () => {

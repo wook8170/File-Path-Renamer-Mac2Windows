@@ -1,8 +1,9 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::time::{Duration, Instant};
 
 use arboard::Clipboard;
 #[cfg(target_os = "macos")]
@@ -96,7 +97,26 @@ fn metadata_key(metadata: &fs::Metadata) -> (u64, u64) {
     }
 }
 
-fn resolve_disk_base_name(source_path: &Path) -> String {
+struct DiskNameResolver {
+    dir_entry_name_cache: HashMap<PathBuf, HashMap<(u64, u64), String>>,
+}
+
+impl DiskNameResolver {
+    fn new() -> Self {
+        Self {
+            dir_entry_name_cache: HashMap::new(),
+        }
+    }
+
+    fn resolve(&mut self, source_path: &Path) -> String {
+        resolve_disk_base_name(source_path, &mut self.dir_entry_name_cache)
+    }
+}
+
+fn resolve_disk_base_name(
+    source_path: &Path,
+    dir_entry_name_cache: &mut HashMap<PathBuf, HashMap<(u64, u64), String>>,
+) -> String {
     let fallback = source_path
         .file_name()
         .map(|v| v.to_string_lossy().to_string())
@@ -107,17 +127,27 @@ fn resolve_disk_base_name(source_path: &Path) -> String {
         Err(_) => return fallback,
     };
     let target_key = metadata_key(&target_meta);
-    let entries = match fs::read_dir(dir) {
-        Ok(v) => v,
-        Err(_) => return fallback,
-    };
-    for entry in entries.flatten() {
-        if let Ok(meta) = entry.metadata() {
-            if metadata_key(&meta) == target_key {
-                return entry.file_name().to_string_lossy().to_string();
+
+    if !dir_entry_name_cache.contains_key(dir) {
+        let entries = match fs::read_dir(dir) {
+            Ok(v) => v,
+            Err(_) => return fallback,
+        };
+        let mut name_map = HashMap::<(u64, u64), String>::new();
+        for entry in entries.flatten() {
+            if let Ok(meta) = entry.metadata() {
+                name_map.insert(metadata_key(&meta), entry.file_name().to_string_lossy().to_string());
             }
         }
+        dir_entry_name_cache.insert(dir.to_path_buf(), name_map);
     }
+
+    if let Some(name_map) = dir_entry_name_cache.get(dir) {
+        if let Some(found) = name_map.get(&target_key) {
+            return found.clone();
+        }
+    }
+
     fallback
 }
 
@@ -139,6 +169,12 @@ fn ensure_unique_path(target_path: &Path, source_path: Option<&Path>) -> (PathBu
     let source_key = source_path
         .and_then(|s| fs::metadata(s).ok())
         .map(|m| metadata_key(&m));
+
+    if let (Some(sk), Ok(target_meta)) = (source_key, fs::metadata(target_path)) {
+        if metadata_key(&target_meta) == sk {
+            return (target_path.to_path_buf(), false);
+        }
+    }
 
     let mut counter = 1;
     loop {
@@ -166,6 +202,51 @@ fn emit_item(app: &tauri::AppHandle, item: &NormalizeResult) {
     let _ = app.emit("normalize-item", item);
 }
 
+fn emit_inspect_batch(app: &tauri::AppHandle, batch: &[SourceInspectResult]) {
+    if batch.is_empty() {
+        return;
+    }
+    let _ = app.emit("inspect-batch", batch);
+}
+
+const INSPECT_BATCH_SIZE: usize = 220;
+const INSPECT_PROGRESS_COUNT_STEP: usize = 50;
+const INSPECT_PROGRESS_INTERVAL: Duration = Duration::from_millis(500);
+
+fn emit_inspect_progress_if_needed(
+    app: &tauri::AppHandle,
+    discovered_count: usize,
+    last_emitted_count: &mut usize,
+    last_emitted_at: &mut Instant,
+) {
+    if discovered_count == 0 {
+        let _ = app.emit("inspect-progress", InspectProgress { file_count: 0 });
+        *last_emitted_count = 0;
+        *last_emitted_at = Instant::now();
+        return;
+    }
+
+    let count_delta = discovered_count.saturating_sub(*last_emitted_count);
+    let time_elapsed = last_emitted_at.elapsed();
+    if count_delta < INSPECT_PROGRESS_COUNT_STEP && time_elapsed < INSPECT_PROGRESS_INTERVAL {
+        return;
+    }
+
+    let _ = app.emit("inspect-progress", InspectProgress { file_count: discovered_count });
+    *last_emitted_count = discovered_count;
+    *last_emitted_at = Instant::now();
+}
+
+fn should_emit_dense(progress: usize, total: usize) -> bool {
+    if progress == 0 || progress >= total {
+        return true;
+    }
+    if total <= 120 {
+        return true;
+    }
+    progress % 5 == 0
+}
+
 fn normalize_file_names_sync(app: &tauri::AppHandle, file_paths: &[String]) -> Result<Vec<NormalizeResult>, String> {
     if file_paths.is_empty() {
         return Ok(vec![]);
@@ -179,10 +260,11 @@ fn normalize_file_names_sync(app: &tauri::AppHandle, file_paths: &[String]) -> R
         let depth_b = b.components().count();
         depth_b.cmp(&depth_a)
     });
+    let mut name_resolver = DiskNameResolver::new();
 
     for (index, source_path) in sorted_paths.iter().enumerate() {
         let source_path = source_path.clone();
-        let source_name = resolve_disk_base_name(&source_path);
+        let source_name = name_resolver.resolve(&source_path);
         let normalized_name: String = source_name.nfc().collect();
         let source_normalization = normalize_type(&source_name);
         let needs_nfc_conversion = source_normalization != "NFC" && source_normalization != "BOTH";
@@ -231,10 +313,14 @@ fn normalize_file_names_sync(app: &tauri::AppHandle, file_paths: &[String]) -> R
             collision_resolved,
         };
         results.push(item.clone());
-        emit_progress(app, index + 1, file_paths.len());
-        emit_item(app, &item);
+        let processed = index + 1;
+        if should_emit_dense(processed, file_paths.len()) {
+            emit_progress(app, processed, file_paths.len());
+            emit_item(app, &item);
+        }
     }
 
+    emit_progress(app, file_paths.len(), file_paths.len());
     Ok(results)
 }
 
@@ -247,10 +333,14 @@ async fn normalize_file_names(app: tauri::AppHandle, file_paths: Vec<String>) ->
 
 fn inspect_file(
     file_path: &Path,
+    source_name: String,
     parent_folder_path: Option<String>,
     seen: &mut HashSet<PathBuf>,
     results: &mut Vec<SourceInspectResult>,
+    batch: &mut Vec<SourceInspectResult>,
     discovered_count: &mut usize,
+    last_emitted_count: &mut usize,
+    last_emitted_at: &mut Instant,
     app: &tauri::AppHandle,
 ) -> Result<bool, io::Error> {
     let normalized = file_path.to_path_buf();
@@ -259,9 +349,8 @@ fn inspect_file(
     }
     seen.insert(normalized);
 
-    let source_name = resolve_disk_base_name(file_path);
     let source_normalization = normalize_type(&source_name);
-    results.push(SourceInspectResult {
+    let inspect_item = SourceInspectResult {
         source_path: file_path.to_string_lossy().to_string(),
         source_name,
         source_normalization: source_normalization.clone(),
@@ -269,18 +358,28 @@ fn inspect_file(
         is_directory: false,
         folder_file_count: 0,
         parent_folder_path,
-    });
+    };
+    results.push(inspect_item.clone());
+    batch.push(inspect_item);
     *discovered_count += 1;
-    let _ = app.emit("inspect-progress", InspectProgress { file_count: *discovered_count });
+    if batch.len() >= INSPECT_BATCH_SIZE {
+        emit_inspect_batch(app, batch);
+        batch.clear();
+    }
+    emit_inspect_progress_if_needed(app, *discovered_count, last_emitted_count, last_emitted_at);
     Ok(true)
 }
 
 fn inspect_dir(
     dir_path: &Path,
+    source_name: String,
     parent_folder_path: Option<String>,
     seen: &mut HashSet<PathBuf>,
     results: &mut Vec<SourceInspectResult>,
+    batch: &mut Vec<SourceInspectResult>,
     discovered_count: &mut usize,
+    last_emitted_count: &mut usize,
+    last_emitted_at: &mut Instant,
     app: &tauri::AppHandle,
 ) -> Result<usize, io::Error> {
     let normalized = dir_path.to_path_buf();
@@ -289,10 +388,9 @@ fn inspect_dir(
     }
     seen.insert(normalized);
 
-    let source_name = resolve_disk_base_name(dir_path);
     let source_normalization = normalize_type(&source_name);
     let index = results.len();
-    results.push(SourceInspectResult {
+    let inspect_item = SourceInspectResult {
         source_path: dir_path.to_string_lossy().to_string(),
         source_name,
         source_normalization: source_normalization.clone(),
@@ -300,7 +398,13 @@ fn inspect_dir(
         is_directory: true,
         folder_file_count: 0,
         parent_folder_path: parent_folder_path.clone(),
-    });
+    };
+    results.push(inspect_item.clone());
+    batch.push(inspect_item);
+    if batch.len() >= INSPECT_BATCH_SIZE {
+        emit_inspect_batch(app, batch);
+        batch.clear();
+    }
 
     let mut file_count = 0usize;
     let mut entries: Vec<_> = fs::read_dir(dir_path)?
@@ -310,23 +414,32 @@ fn inspect_dir(
 
     for entry in entries {
         let path = entry.path();
+        let entry_name = entry.file_name().to_string_lossy().to_string();
         if let Ok(file_type) = entry.file_type() {
             if file_type.is_dir() {
                 file_count += inspect_dir(
                     &path,
+                    entry_name,
                     Some(dir_path.to_string_lossy().to_string()),
                     seen,
                     results,
+                    batch,
                     discovered_count,
+                    last_emitted_count,
+                    last_emitted_at,
                     app,
                 )?;
             } else if file_type.is_file() {
                 if inspect_file(
                     &path,
+                    entry_name,
                     Some(dir_path.to_string_lossy().to_string()),
                     seen,
                     results,
+                    batch,
                     discovered_count,
+                    last_emitted_count,
+                    last_emitted_at,
                     app,
                 )? {
                     file_count += 1;
@@ -345,24 +458,53 @@ fn inspect_dir(
 fn inspect_source_files_sync(app: &tauri::AppHandle, file_paths: &[String]) -> Result<Vec<SourceInspectResult>, String> {
     let mut results = Vec::<SourceInspectResult>::new();
     let mut seen = HashSet::<PathBuf>::new();
+    let mut batch = Vec::<SourceInspectResult>::with_capacity(128);
     let mut discovered_count = 0usize;
-    let _ = app.emit("inspect-progress", InspectProgress { file_count: 0 });
+    let mut name_resolver = DiskNameResolver::new();
+    let mut last_emitted_count = 0usize;
+    let mut last_emitted_at = Instant::now();
+    emit_inspect_progress_if_needed(app, 0, &mut last_emitted_count, &mut last_emitted_at);
 
     for file_path in file_paths {
         let target = PathBuf::from(file_path);
+        let root_name = name_resolver.resolve(&target);
         match fs::metadata(&target) {
             Ok(meta) if meta.is_dir() => {
-                inspect_dir(&target, None, &mut seen, &mut results, &mut discovered_count, app)
+                inspect_dir(
+                    &target,
+                    root_name,
+                    None,
+                    &mut seen,
+                    &mut results,
+                    &mut batch,
+                    &mut discovered_count,
+                    &mut last_emitted_count,
+                    &mut last_emitted_at,
+                    app,
+                )
                     .map_err(|e| format!("폴더 분석 실패: {e}"))?;
             }
             Ok(meta) if meta.is_file() => {
-                inspect_file(&target, None, &mut seen, &mut results, &mut discovered_count, app)
+                inspect_file(
+                    &target,
+                    root_name,
+                    None,
+                    &mut seen,
+                    &mut results,
+                    &mut batch,
+                    &mut discovered_count,
+                    &mut last_emitted_count,
+                    &mut last_emitted_at,
+                    app,
+                )
                     .map_err(|e| format!("파일 분석 실패: {e}"))?;
             }
             _ => {}
         }
     }
 
+    emit_inspect_batch(app, &batch);
+    let _ = app.emit("inspect-progress", InspectProgress { file_count: discovered_count });
     Ok(results)
 }
 
