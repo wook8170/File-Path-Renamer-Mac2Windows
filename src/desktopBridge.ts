@@ -75,6 +75,17 @@ export type DaemonConvertTargetsResult = {
   changedCount: number;
 };
 
+export type AutoConvertHistoryEntry = {
+  timestamp: number;
+  sourcePath: string;
+  outputPath: string;
+  sourceName: string;
+  outputName: string;
+  changed: boolean;
+  isDirectory: boolean;
+  status: string;
+};
+
 type ClipboardCopyResult = {
   copiedCount: number;
   mode: "file" | "text" | "none";
@@ -102,6 +113,10 @@ export type DesktopBridge = {
   pickMonitorDirectory(): Promise<PickedMonitorDirectory | null>;
   loadMonitorState(): Promise<MonitorStateEntry[]>;
   saveMonitorState(entries: MonitorStateEntry[]): Promise<void>;
+  loadAutoConvertHistory(): Promise<AutoConvertHistoryEntry[]>;
+  getAutoConvertHistoryCount(): Promise<number>;
+  appendAutoConvertHistory(entries: AutoConvertHistoryEntry[]): Promise<number>;
+  clearAutoConvertHistory(): Promise<void>;
   setTrayBadgeCount(count: number): Promise<void>;
   isLaunchAtLoginEnabled(): Promise<boolean>;
   setLaunchAtLoginEnabled(enabled: boolean): Promise<void>;
@@ -117,6 +132,8 @@ export type DesktopBridge = {
   onMonitorWatchEvent(listener: (event: MonitorWatchEvent) => void): Promise<() => void>;
   onMonitorWatchError(listener: (message: string) => void): Promise<() => void>;
   onMainWindowVisibility(listener: (visible: boolean) => void): Promise<() => void>;
+  onAutoConvertHistoryCount(listener: (count: number) => void): Promise<() => void>;
+  openAutoConvertHistoryWindow(): Promise<void>;
   startFileDrag(filePaths: string[]): Promise<void>;
 };
 
@@ -256,6 +273,18 @@ export const desktopBridge: DesktopBridge = {
   saveMonitorState(entries) {
     return invoke("save_monitor_state", { entries });
   },
+  loadAutoConvertHistory() {
+    return invoke<AutoConvertHistoryEntry[]>("load_auto_convert_history");
+  },
+  getAutoConvertHistoryCount() {
+    return invoke<number>("get_auto_convert_history_count");
+  },
+  appendAutoConvertHistory(entries) {
+    return invoke<number>("append_auto_convert_history", { entries });
+  },
+  clearAutoConvertHistory() {
+    return invoke("clear_auto_convert_history");
+  },
   setTrayBadgeCount(count) {
     return invoke("set_tray_badge_count", { count });
   },
@@ -348,6 +377,42 @@ export const desktopBridge: DesktopBridge = {
     return () => {
       unlisten();
     };
+  },
+  async onAutoConvertHistoryCount(listener) {
+    const { listen } = await getEventModule();
+    const unlisten = await listen<number>("auto-convert-history-count", (event) => {
+      listener(event.payload);
+    });
+    return () => {
+      unlisten();
+    };
+  },
+  async openAutoConvertHistoryWindow() {
+    const { WebviewWindow } = await import("@tauri-apps/api/webviewWindow");
+    const existing = await WebviewWindow.getByLabel("auto-convert-history");
+    if (existing) {
+      await existing.show();
+      await existing.setFocus();
+      return;
+    }
+    const url = (() => {
+      try {
+        return new URL("auto-history.html", window.location.href).toString();
+      } catch {
+        return "auto-history.html";
+      }
+    })();
+    new WebviewWindow("auto-convert-history", {
+      title: "백그라운드 자동 변환 내역",
+      width: 980,
+      height: 680,
+      resizable: true,
+      minimizable: true,
+      maximizable: false,
+      focus: true,
+      visible: true,
+      url
+    });
   },
   async startFileDrag(filePaths) {
     const normalized = Array.from(new Set(filePaths.filter((path) => path.trim().length > 0)));

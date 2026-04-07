@@ -16,9 +16,11 @@ import heroFolder from "./icons/hero/folder.svg?raw";
 import heroSparkles from "./icons/hero/sparkles.svg?raw";
 import heroWindow from "./icons/hero/window.svg?raw";
 import heroXMark from "./icons/hero/x-mark.svg?raw";
+import heroListBullet from "./icons/hero/list-bullet.svg?raw";
 import {
   desktopBridge,
   type DesktopBridge,
+  type AutoConvertHistoryEntry,
   type BeforeItem as RawBeforeItem,
   type InspectProgress,
   type PickedMonitorDirectory,
@@ -129,6 +131,7 @@ const ICON_CENTER_REFRESH = asHeroIcon(heroArrowPath, "h-[22px] w-[22px]");
 const ICON_SELECT_ALL = asHeroIcon(heroCheckCircle, "h-[18px] w-[18px] shrink-0");
 const ICON_COPY_PATHS = asHeroIcon(heroLink, "h-[18px] w-[18px] shrink-0");
 const ICON_COPY_FILES = asHeroIcon(heroDocumentDuplicate, "h-[18px] w-[18px] shrink-0");
+const ICON_AUTO_CONVERT_HISTORY = asHeroIcon(heroListBullet, "h-[18px] w-[18px]");
 const ICON_FOLDER_CHIP = asHeroIcon(heroFolder, "h-3.5 w-3.5");
 const ICON_NFD_CHIP = asHeroIcon(heroSparkles, "h-3.5 w-3.5");
 const ICON_NFC_CHIP = asHeroIcon(heroWindow, "h-3.5 w-3.5");
@@ -169,6 +172,19 @@ app.innerHTML = `
             </label>
           </div>
           <div class="flex items-center gap-2">
+            <button
+              id="auto-convert-history-button"
+              class="relative inline-flex h-9 w-9 items-center justify-center rounded-md border border-stone-300 bg-stone-50 text-stone-700 transition hover:border-stone-400 hover:bg-stone-100"
+              type="button"
+              aria-label="자동 변환 내역"
+              title="자동 변환 내역"
+            >
+              ${ICON_AUTO_CONVERT_HISTORY}
+              <span
+                id="auto-convert-history-badge"
+                class="absolute -right-1 -top-1 hidden min-w-4 rounded-full bg-violet-600 px-1 text-center text-[10px] font-semibold leading-4 text-white"
+              ></span>
+            </button>
             <button
               id="theme-toggle"
               class="inline-flex h-9 w-9 items-center justify-center rounded-md border border-stone-300 bg-stone-50 text-stone-700 transition hover:border-stone-400 hover:bg-stone-100"
@@ -489,6 +505,8 @@ const copyPathsButton = document.querySelector<HTMLButtonElement>("#copy-paths")
 const centerConvertButton = document.querySelector<HTMLButtonElement>("#center-convert")!;
 const centerConvertBadge = document.querySelector<HTMLSpanElement>("#center-convert-badge")!;
 const centerRefreshButton = document.querySelector<HTMLButtonElement>("#center-refresh")!;
+const autoConvertHistoryButton = document.querySelector<HTMLButtonElement>("#auto-convert-history-button")!;
+const autoConvertHistoryBadge = document.querySelector<HTMLSpanElement>("#auto-convert-history-badge")!;
 const afterContextMenu = document.querySelector<HTMLDivElement>("#after-context-menu")!;
 const afterContextCopyFilesButton = document.querySelector<HTMLButtonElement>("#after-context-copy-files")!;
 const afterContextSelectAllButton = document.querySelector<HTMLButtonElement>("#after-context-select-all")!;
@@ -541,6 +559,8 @@ if (
   !centerConvertButton ||
   !centerConvertBadge ||
   !centerRefreshButton ||
+  !autoConvertHistoryButton ||
+  !autoConvertHistoryBadge ||
   !afterContextMenu ||
   !afterContextCopyFilesButton ||
   !afterContextSelectAllButton ||
@@ -617,6 +637,7 @@ let monitorStateSaveTimerId = 0;
 let monitorStateSaveInFlight = false;
 let monitorStateSaveQueued = false;
 let trayBackgroundConvertedCount = 0;
+let autoConvertHistoryCount = 0;
 let beforeVirtualLoadingTimerId = 0;
 let afterVirtualLoadingTimerId = 0;
 const systemThemeMediaQuery = window.matchMedia("(prefers-color-scheme: dark)");
@@ -822,6 +843,11 @@ function syncAutomationSettingControls() {
   syncAutoConvertFilesUI();
 }
 
+function updateAutoConvertHistoryBadge() {
+  autoConvertHistoryBadge.textContent = autoConvertHistoryCount > 99 ? "99+" : String(autoConvertHistoryCount);
+  autoConvertHistoryBadge.classList.toggle("hidden", autoConvertHistoryCount <= 0);
+}
+
 function clearMonitorPendingEntriesByPaths(paths: string[]) {
   if (monitorPendingEntriesByDirectory.size === 0 || paths.length === 0) {
     return;
@@ -847,6 +873,81 @@ function clearMonitorPendingEntriesByPaths(paths: string[]) {
     updateMonitorLabels();
     schedulePersistMonitorState();
   }
+}
+
+type MonitorPendingFilterResult = {
+  pathsToEnqueue: string[];
+  excludedPaths: string[];
+};
+
+function isExcludedPathByDirectory(path: string, directorySet: Set<string>) {
+  for (const directoryPath of directorySet) {
+    if (isPathInFolderTree(path, directoryPath)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+async function filterAlreadyHandledMonitorPendingPaths(
+  pendingPaths: string[]
+): Promise<MonitorPendingFilterResult> {
+  if (pendingPaths.length === 0) {
+    return { pathsToEnqueue: [], excludedPaths: [] };
+  }
+
+  const normalizedPending = pendingPaths.map((path) => ({
+    original: path,
+    normalized: normalizePathForCompare(path)
+  }));
+
+  const excludeExactSet = new Set<string>();
+  const excludeDirectorySet = new Set<string>();
+  const addExcludePath = (path: string, isDirectory: boolean) => {
+    const normalized = normalizePathForCompare(path);
+    excludeExactSet.add(normalized);
+    if (isDirectory) {
+      excludeDirectorySet.add(normalized);
+    }
+  };
+
+  // 이미 before/after 목록에 있는 항목은 다시 enqueue 하지 않는다.
+  for (const item of state.beforeItems) {
+    addExcludePath(item.sourcePath, item.isDirectory);
+  }
+  for (const item of state.results) {
+    addExcludePath(item.sourcePath, item.isDirectory);
+    addExcludePath(item.outputPath, item.isDirectory);
+  }
+
+  // 백그라운드 자동 변환 내역에 있는 항목도 변환 대상 찾기에서는 제외한다.
+  try {
+    const backgroundHistory = await window.desktopBridge.loadAutoConvertHistory();
+    for (const entry of backgroundHistory) {
+      addExcludePath(entry.sourcePath, entry.isDirectory);
+      addExcludePath(entry.outputPath, entry.isDirectory);
+    }
+  } catch (error) {
+    appendStatusLog(
+      `자동 변환 내역 기반 중복 제외를 건너뜁니다. 원인: ${getErrorMessage(error, "내역 조회 실패")}`,
+      "error"
+    );
+  }
+
+  const pathsToEnqueue: string[] = [];
+  const excludedPaths: string[] = [];
+  for (const entry of normalizedPending) {
+    const shouldExclude =
+      excludeExactSet.has(entry.normalized) ||
+      isExcludedPathByDirectory(entry.normalized, excludeDirectorySet);
+    if (shouldExclude) {
+      excludedPaths.push(entry.original);
+      continue;
+    }
+    pathsToEnqueue.push(entry.original);
+  }
+
+  return { pathsToEnqueue, excludedPaths };
 }
 
 async function scheduleAutoMonitorConvertIfNeeded() {
@@ -2865,9 +2966,18 @@ async function applyPendingMonitorChanges() {
     updateMonitorLabels();
 
     const pendingPaths = Array.from(state.monitorPendingPaths);
-    if (pendingPaths.length > 0) {
-      appendStatusLog(`변환 대상 검색 완료: ${pendingPaths.length}개를 원본 파일 목록에 추가합니다.`, "success");
-      await enqueuePaths(pendingPaths);
+    const { pathsToEnqueue, excludedPaths } = await filterAlreadyHandledMonitorPendingPaths(pendingPaths);
+    if (excludedPaths.length > 0) {
+      clearMonitorPendingEntriesByPaths(excludedPaths);
+      appendStatusLog(
+        `변환 대상 검색: 이미 처리된 ${excludedPaths.length}개 항목은 제외했습니다.`,
+        "idle"
+      );
+    }
+
+    if (pathsToEnqueue.length > 0) {
+      appendStatusLog(`변환 대상 검색 완료: ${pathsToEnqueue.length}개를 원본 파일 목록에 추가합니다.`, "success");
+      await enqueuePaths(pathsToEnqueue);
     } else {
       appendStatusLog("변환 대상 검색 완료: 새로 추가할 항목이 없습니다.", "success");
     }
@@ -3045,6 +3155,25 @@ async function convertSourcePaths(sourcePaths: string[], isBackgroundAutoConvert
 
       if (isBackgroundAutoConvert && batchResults.length > 0) {
         updateTrayBackgroundBadge(trayBackgroundConvertedCount + batchResults.length);
+        const historyEntries: AutoConvertHistoryEntry[] = batchResults.map((item) => ({
+          timestamp: Date.now(),
+          sourcePath: item.sourcePath,
+          outputPath: item.outputPath,
+          sourceName: item.sourceName,
+          outputName: item.outputName,
+          changed: item.changed,
+          isDirectory: item.isDirectory,
+          status: item.changed ? "변환됨" : "이미 NFC"
+        }));
+        try {
+          autoConvertHistoryCount = await window.desktopBridge.appendAutoConvertHistory(historyEntries);
+          updateAutoConvertHistoryBadge();
+        } catch (error) {
+          appendStatusLog(
+            `자동 변환 내역 저장에 실패했습니다. 원인: ${getErrorMessage(error, "내역 저장 실패")}`,
+            "error"
+          );
+        }
       }
 
       void batchResults;
@@ -3637,6 +3766,12 @@ autoConvertFilesToggle.addEventListener("change", () => {
   }
 });
 
+autoConvertHistoryButton.addEventListener("click", () => {
+  void window.desktopBridge.openAutoConvertHistoryWindow().catch((error) => {
+    setStatus(`자동 변환 내역 창을 열지 못했습니다. 원인: ${getErrorMessage(error, "창 열기 실패")}`, "error");
+  });
+});
+
 copySelectionButton.addEventListener("click", () => {
   void copySelectedFiles();
 });
@@ -3894,3 +4029,28 @@ void window.desktopBridge.onMainWindowVisibility((visible) => {
     "error"
   );
 });
+
+void window.desktopBridge
+  .getAutoConvertHistoryCount()
+  .then((count) => {
+    autoConvertHistoryCount = count;
+    updateAutoConvertHistoryBadge();
+  })
+  .catch((error) => {
+    appendStatusLog(
+      `자동 변환 내역 개수 조회에 실패했습니다. 원인: ${getErrorMessage(error, "개수 조회 실패")}`,
+      "error"
+    );
+  });
+
+void window.desktopBridge
+  .onAutoConvertHistoryCount((count) => {
+    autoConvertHistoryCount = count;
+    updateAutoConvertHistoryBadge();
+  })
+  .catch((error) => {
+    appendStatusLog(
+      `자동 변환 내역 이벤트 등록 실패. 원인: ${getErrorMessage(error, "이벤트 등록 실패")}`,
+      "error"
+    );
+  });

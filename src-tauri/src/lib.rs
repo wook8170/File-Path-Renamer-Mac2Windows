@@ -187,6 +187,19 @@ struct ClipboardCopyResult {
     error_message: Option<String>,
 }
 
+#[derive(Serialize, Deserialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct AutoConvertHistoryEntry {
+    timestamp: u64,
+    source_path: String,
+    output_path: String,
+    source_name: String,
+    output_name: String,
+    changed: bool,
+    is_directory: bool,
+    status: String,
+}
+
 #[derive(Default)]
 struct BookmarkStore {
     entries: Mutex<HashMap<String, String>>,
@@ -881,6 +894,54 @@ fn monitor_state_file_path<R: tauri::Runtime>(app: &tauri::AppHandle<R>) -> Resu
     Ok(app_data_dir.join("monitor-state.json"))
 }
 
+fn auto_convert_history_file_path<R: tauri::Runtime>(
+    app: &tauri::AppHandle<R>,
+) -> Result<PathBuf, String> {
+    let app_data_dir = app
+        .path()
+        .app_data_dir()
+        .map_err(|e| format!("앱 데이터 경로 확인 실패: {e}"))?;
+    fs::create_dir_all(&app_data_dir).map_err(|e| format!("앱 데이터 폴더 생성 실패: {e}"))?;
+    Ok(app_data_dir.join("auto-convert-history.json"))
+}
+
+fn read_auto_convert_history<R: tauri::Runtime>(
+    app: &tauri::AppHandle<R>,
+) -> Result<Vec<AutoConvertHistoryEntry>, String> {
+    let file_path = auto_convert_history_file_path(app)?;
+    if !file_path.exists() {
+        return Ok(Vec::new());
+    }
+    let contents =
+        fs::read_to_string(&file_path).map_err(|e| format!("자동 변환 내역 파일 읽기 실패: {e}"))?;
+    serde_json::from_str::<Vec<AutoConvertHistoryEntry>>(&contents)
+        .map_err(|e| format!("자동 변환 내역 파싱 실패: {e}"))
+}
+
+fn write_auto_convert_history<R: tauri::Runtime>(
+    app: &tauri::AppHandle<R>,
+    entries: &[AutoConvertHistoryEntry],
+) -> Result<(), String> {
+    let file_path = auto_convert_history_file_path(app)?;
+    let contents = serde_json::to_string(entries).map_err(|e| format!("자동 변환 내역 직렬화 실패: {e}"))?;
+    fs::write(&file_path, contents).map_err(|e| format!("자동 변환 내역 파일 저장 실패: {e}"))
+}
+
+fn emit_auto_convert_history_count<R: tauri::Runtime>(app: &tauri::AppHandle<R>, count: usize) {
+    let _ = app.emit("auto-convert-history-count", count);
+}
+
+const MAX_AUTO_CONVERT_HISTORY_LEN: usize = 500;
+
+fn trim_auto_convert_history(entries: &mut Vec<AutoConvertHistoryEntry>) -> bool {
+    if entries.len() <= MAX_AUTO_CONVERT_HISTORY_LEN {
+        return false;
+    }
+    let keep_from = entries.len() - MAX_AUTO_CONVERT_HISTORY_LEN;
+    *entries = entries.split_off(keep_from);
+    true
+}
+
 #[tauri::command]
 fn load_monitor_state(app: tauri::AppHandle, bookmark_store: tauri::State<BookmarkStore>) -> Result<Vec<MonitorStateEntry>, String> {
     let file_path = monitor_state_file_path(&app)?;
@@ -906,6 +967,50 @@ fn save_monitor_state(
         serde_json::to_string(&entries).map_err(|e| format!("모니터링 상태 직렬화 실패: {e}"))?;
     fs::write(&file_path, contents).map_err(|e| format!("모니터링 상태 파일 저장 실패: {e}"))?;
     sync_bookmark_store(&bookmark_store, &entries);
+    Ok(())
+}
+
+#[tauri::command]
+fn load_auto_convert_history(app: tauri::AppHandle) -> Result<Vec<AutoConvertHistoryEntry>, String> {
+    let mut entries = read_auto_convert_history(&app)?;
+    if trim_auto_convert_history(&mut entries) {
+        write_auto_convert_history(&app, &entries)?;
+        emit_auto_convert_history_count(&app, entries.len());
+    }
+    Ok(entries)
+}
+
+#[tauri::command]
+fn get_auto_convert_history_count(app: tauri::AppHandle) -> Result<usize, String> {
+    let mut entries = read_auto_convert_history(&app)?;
+    if trim_auto_convert_history(&mut entries) {
+        write_auto_convert_history(&app, &entries)?;
+        emit_auto_convert_history_count(&app, entries.len());
+    }
+    Ok(entries.len())
+}
+
+#[tauri::command]
+fn append_auto_convert_history(
+    app: tauri::AppHandle,
+    entries: Vec<AutoConvertHistoryEntry>,
+) -> Result<usize, String> {
+    if entries.is_empty() {
+        return get_auto_convert_history_count(app);
+    }
+    let mut current = read_auto_convert_history(&app)?;
+    current.extend(entries);
+    trim_auto_convert_history(&mut current);
+    write_auto_convert_history(&app, &current)?;
+    let count = current.len();
+    emit_auto_convert_history_count(&app, count);
+    Ok(count)
+}
+
+#[tauri::command]
+fn clear_auto_convert_history(app: tauri::AppHandle) -> Result<(), String> {
+    write_auto_convert_history(&app, &[])?;
+    emit_auto_convert_history_count(&app, 0);
     Ok(())
 }
 
@@ -1795,7 +1900,7 @@ pub fn run() {
         .manage(MonitorWatchState::default())
         .plugin(tauri_plugin_autostart::init(
             #[cfg(target_os = "macos")]
-            MacosLauncher::LaunchAgent,
+            MacosLauncher::AppleScript,
             None::<Vec<&str>>,
         ))
         .plugin(tauri_plugin_dialog::init())
@@ -1883,6 +1988,10 @@ pub fn run() {
             stop_monitor_watch,
             load_monitor_state,
             save_monitor_state,
+            load_auto_convert_history,
+            get_auto_convert_history_count,
+            append_auto_convert_history,
+            clear_auto_convert_history,
             pick_monitor_directory,
             open_item,
             show_item_in_folder,
