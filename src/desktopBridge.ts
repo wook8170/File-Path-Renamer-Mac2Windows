@@ -1,9 +1,3 @@
-import { listen } from "@tauri-apps/api/event";
-import { invoke } from "@tauri-apps/api/core";
-import { open } from "@tauri-apps/plugin-dialog";
-import { resolveResource } from "@tauri-apps/api/path";
-import { startDrag } from "@crabnebula/tauri-plugin-drag";
-
 export type NormalizeResult = {
   sourcePath: string;
   outputPath: string;
@@ -11,7 +5,10 @@ export type NormalizeResult = {
   outputName: string;
   sourceNormalization: "NFC" | "NFD" | "BOTH" | "MIXED";
   changed: boolean;
+  isDirectory: boolean;
   collisionResolved: boolean;
+  displayName: string;
+  compactPath: string;
 };
 
 export type NormalizeProgress = {
@@ -31,6 +28,51 @@ export type BeforeItem = {
   isDirectory: boolean;
   folderFileCount: number;
   parentFolderPath: string | null;
+  isNfdLike: boolean;
+  displayName: string;
+  normalizedDisplayName: string;
+  compactPath: string;
+};
+
+export type MonitorSnapshotEntry = {
+  path: string;
+  id: string;
+  isDirectory: boolean;
+  modifiedAt: number;
+};
+
+export type MonitorStateEntry = {
+  path: string;
+  lastSnapshotAt: number | null;
+  snapshotEntries: MonitorSnapshotEntry[];
+  pendingEntries: MonitorSnapshotEntry[];
+  bookmarkData: string | null;
+};
+
+export type PickedMonitorDirectory = {
+  path: string;
+  bookmarkData: string | null;
+};
+
+export type MonitorWatchEvent = {
+  roots: string[];
+  paths: string[];
+  kind: string;
+};
+
+export type DaemonCollectTargetsResult = {
+  items: BeforeItem[];
+  requestedCount: number;
+  inspectedCount: number;
+  addedCount: number;
+  skippedExistingCount: number;
+};
+
+export type DaemonConvertTargetsResult = {
+  results: NormalizeResult[];
+  requestedCount: number;
+  uniqueCount: number;
+  changedCount: number;
 };
 
 type ClipboardCopyResult = {
@@ -46,8 +88,23 @@ type ClipboardCopyResult = {
 
 export type DesktopBridge = {
   normalizeFileNames(filePaths: string[]): Promise<NormalizeResult[]>;
+  daemonConvertTargets(filePaths: string[]): Promise<DaemonConvertTargetsResult>;
   pickFiles(): Promise<string[]>;
+  pickDirectory(): Promise<string | null>;
   inspectSourceFiles(filePaths: string[]): Promise<BeforeItem[]>;
+  daemonCollectTargets(filePaths: string[], excludePaths: string[]): Promise<DaemonCollectTargetsResult>;
+  inspectPathsShallow(filePaths: string[]): Promise<BeforeItem[]>;
+  scanMonitorDirectory(rootPath: string): Promise<MonitorSnapshotEntry[]>;
+  scanMonitorPaths(paths: string[]): Promise<MonitorSnapshotEntry[]>;
+  daemonCollectPendingEntries(roots: string[]): Promise<MonitorSnapshotEntry[]>;
+  startMonitorWatch(paths: string[]): Promise<void>;
+  stopMonitorWatch(): Promise<void>;
+  pickMonitorDirectory(): Promise<PickedMonitorDirectory | null>;
+  loadMonitorState(): Promise<MonitorStateEntry[]>;
+  saveMonitorState(entries: MonitorStateEntry[]): Promise<void>;
+  setTrayBadgeCount(count: number): Promise<void>;
+  isLaunchAtLoginEnabled(): Promise<boolean>;
+  setLaunchAtLoginEnabled(enabled: boolean): Promise<void>;
   getPathForFile(file: File): string;
   openItem(filePath: string): Promise<void>;
   showItemInFolder(filePath: string): Promise<void>;
@@ -57,15 +114,60 @@ export type DesktopBridge = {
   onInspectBatch(listener: (items: BeforeItem[]) => void): Promise<() => void>;
   onNormalizeProgress(listener: (progress: NormalizeProgress) => void): Promise<() => void>;
   onNormalizeItem(listener: (item: NormalizeResult) => void): Promise<() => void>;
+  onMonitorWatchEvent(listener: (event: MonitorWatchEvent) => void): Promise<() => void>;
+  onMonitorWatchError(listener: (message: string) => void): Promise<() => void>;
+  onMainWindowVisibility(listener: (visible: boolean) => void): Promise<() => void>;
   startFileDrag(filePaths: string[]): Promise<void>;
 };
 
 let dragIconPathCache: string | null = null;
+let coreModulePromise: Promise<typeof import("@tauri-apps/api/core")> | null = null;
+let eventModulePromise: Promise<typeof import("@tauri-apps/api/event")> | null = null;
+let dialogModulePromise: Promise<typeof import("@tauri-apps/plugin-dialog")> | null = null;
+let pathModulePromise: Promise<typeof import("@tauri-apps/api/path")> | null = null;
+let dragModulePromise: Promise<typeof import("@crabnebula/tauri-plugin-drag")> | null = null;
+let autostartModulePromise: Promise<typeof import("@tauri-apps/plugin-autostart")> | null = null;
+
+function getCoreModule() {
+  coreModulePromise ??= import("@tauri-apps/api/core");
+  return coreModulePromise;
+}
+
+function getEventModule() {
+  eventModulePromise ??= import("@tauri-apps/api/event");
+  return eventModulePromise;
+}
+
+function getDialogModule() {
+  dialogModulePromise ??= import("@tauri-apps/plugin-dialog");
+  return dialogModulePromise;
+}
+
+function getPathModule() {
+  pathModulePromise ??= import("@tauri-apps/api/path");
+  return pathModulePromise;
+}
+
+function getDragModule() {
+  dragModulePromise ??= import("@crabnebula/tauri-plugin-drag");
+  return dragModulePromise;
+}
+
+function getAutostartModule() {
+  autostartModulePromise ??= import("@tauri-apps/plugin-autostart");
+  return autostartModulePromise;
+}
+
+async function invoke<T>(command: string, args?: Record<string, unknown>) {
+  const core = await getCoreModule();
+  return core.invoke<T>(command, args);
+}
 
 async function getDragIconPath() {
   if (dragIconPathCache) {
     return dragIconPathCache;
   }
+  const { resolveResource } = await getPathModule();
   const candidates = ["icons/32x32.png", "32x32.png", "icons/icon.png", "icon.png"];
   for (const candidate of candidates) {
     try {
@@ -82,6 +184,7 @@ async function getDragIconPath() {
 }
 
 async function pickFilePathsFromDialog() {
+  const { open } = await getDialogModule();
   const selected = await open({
     multiple: true,
     directory: false
@@ -95,15 +198,78 @@ async function pickFilePathsFromDialog() {
   return [selected];
 }
 
+async function pickDirectoryPathFromDialog() {
+  const { open } = await getDialogModule();
+  const selected = await open({
+    multiple: false,
+    directory: true
+  });
+  if (!selected) {
+    return null;
+  }
+  return Array.isArray(selected) ? (selected[0] ?? null) : selected;
+}
+
 export const desktopBridge: DesktopBridge = {
   normalizeFileNames(filePaths) {
     return invoke<NormalizeResult[]>("normalize_file_names", { filePaths });
   },
+  daemonConvertTargets(filePaths) {
+    return invoke<DaemonConvertTargetsResult>("daemon_convert_targets", { filePaths });
+  },
   pickFiles() {
     return pickFilePathsFromDialog();
   },
+  pickDirectory() {
+    return pickDirectoryPathFromDialog();
+  },
   inspectSourceFiles(filePaths) {
     return invoke<BeforeItem[]>("inspect_source_files", { filePaths });
+  },
+  daemonCollectTargets(filePaths, excludePaths) {
+    return invoke<DaemonCollectTargetsResult>("daemon_collect_targets", { filePaths, excludePaths });
+  },
+  inspectPathsShallow(filePaths) {
+    return invoke<BeforeItem[]>("inspect_paths_shallow", { filePaths });
+  },
+  scanMonitorDirectory(rootPath) {
+    return invoke<MonitorSnapshotEntry[]>("scan_monitor_directory", { rootPath });
+  },
+  scanMonitorPaths(paths) {
+    return invoke<MonitorSnapshotEntry[]>("scan_monitor_paths", { paths });
+  },
+  daemonCollectPendingEntries(roots) {
+    return invoke<MonitorSnapshotEntry[]>("daemon_collect_pending_entries", { roots });
+  },
+  startMonitorWatch(paths) {
+    return invoke("start_monitor_watch", { paths });
+  },
+  stopMonitorWatch() {
+    return invoke("stop_monitor_watch");
+  },
+  pickMonitorDirectory() {
+    return invoke<PickedMonitorDirectory | null>("pick_monitor_directory");
+  },
+  loadMonitorState() {
+    return invoke<MonitorStateEntry[]>("load_monitor_state");
+  },
+  saveMonitorState(entries) {
+    return invoke("save_monitor_state", { entries });
+  },
+  setTrayBadgeCount(count) {
+    return invoke("set_tray_badge_count", { count });
+  },
+  async isLaunchAtLoginEnabled() {
+    const { isEnabled } = await getAutostartModule();
+    return isEnabled();
+  },
+  async setLaunchAtLoginEnabled(enabled) {
+    const { enable, disable } = await getAutostartModule();
+    if (enabled) {
+      await enable();
+      return;
+    }
+    await disable();
   },
   getPathForFile(file) {
     return ((file as unknown as { path?: string }).path ?? "").toString();
@@ -121,6 +287,7 @@ export const desktopBridge: DesktopBridge = {
     return invoke<{ copiedCount: number }>("copy_path_text_to_clipboard", { filePaths });
   },
   async onInspectProgress(listener) {
+    const { listen } = await getEventModule();
     const unlisten = await listen<InspectProgress>("inspect-progress", (event) => {
       listener(event.payload);
     });
@@ -129,6 +296,7 @@ export const desktopBridge: DesktopBridge = {
     };
   },
   async onInspectBatch(listener) {
+    const { listen } = await getEventModule();
     const unlisten = await listen<BeforeItem[]>("inspect-batch", (event) => {
       listener(event.payload);
     });
@@ -137,6 +305,7 @@ export const desktopBridge: DesktopBridge = {
     };
   },
   async onNormalizeProgress(listener) {
+    const { listen } = await getEventModule();
     const unlisten = await listen<NormalizeProgress>("normalize-progress", (event) => {
       listener(event.payload);
     });
@@ -145,7 +314,35 @@ export const desktopBridge: DesktopBridge = {
     };
   },
   async onNormalizeItem(listener) {
+    const { listen } = await getEventModule();
     const unlisten = await listen<NormalizeResult>("normalize-item", (event) => {
+      listener(event.payload);
+    });
+    return () => {
+      unlisten();
+    };
+  },
+  async onMonitorWatchEvent(listener) {
+    const { listen } = await getEventModule();
+    const unlisten = await listen<MonitorWatchEvent>("monitor-watch-event", (event) => {
+      listener(event.payload);
+    });
+    return () => {
+      unlisten();
+    };
+  },
+  async onMonitorWatchError(listener) {
+    const { listen } = await getEventModule();
+    const unlisten = await listen<string>("monitor-watch-error", (event) => {
+      listener(event.payload);
+    });
+    return () => {
+      unlisten();
+    };
+  },
+  async onMainWindowVisibility(listener) {
+    const { listen } = await getEventModule();
+    const unlisten = await listen<boolean>("main-window-visibility", (event) => {
       listener(event.payload);
     });
     return () => {
@@ -158,6 +355,7 @@ export const desktopBridge: DesktopBridge = {
       throw new Error("드래그할 파일이 없습니다.");
     }
     const icon = await getDragIconPath();
+    const { startDrag } = await getDragModule();
     await startDrag({
       item: normalized,
       icon,

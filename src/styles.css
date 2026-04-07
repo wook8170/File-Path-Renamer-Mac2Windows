@@ -1,5 +1,3 @@
-@import "pretendard/dist/web/variable/pretendardvariable.css";
-
 @tailwind base;
 @tailwind components;
 @tailwind utilities;
@@ -42,7 +40,36 @@
 }
 
 @layer components {
-  body.theme-dark #top-section,
+  .after-convert-source-bg {
+    @apply border-emerald-300 bg-emerald-50 text-emerald-700;
+  }
+
+  .after-convert-source-manual {
+    @apply border-sky-300 bg-sky-50 text-sky-700;
+  }
+
+  .monitor-activity-blink {
+    animation: monitor-activity-blink 1.8s ease-in-out infinite;
+  }
+
+  @keyframes monitor-activity-blink {
+    0%,
+    100% {
+      opacity: 1;
+      transform: scale(1);
+      box-shadow: 0 0 0 0 rgba(16, 185, 129, 0.26);
+    }
+
+    50% {
+      opacity: 0.46;
+      transform: scale(0.92);
+      box-shadow: 0 0 0 6px rgba(16, 185, 129, 0.08);
+    }
+  }
+
+  body.theme-dark #top-header-card,
+  body.theme-dark #top-monitor-card,
+  body.theme-dark #convert-progress-card,
   body.theme-dark #before-section,
   body.theme-dark #after-section {
     @apply border-slate-700/90 bg-slate-800/90;
@@ -85,6 +112,10 @@
   }
 
   body.theme-dark #theme-toggle,
+  body.theme-dark #monitor-apply,
+  body.theme-dark #monitor-directory-pick,
+  body.theme-dark #monitor-directory-clear,
+  body.theme-dark #monitor-directory-list,
   body.theme-dark #before-filter-toggle,
   body.theme-dark #select-all-after,
   body.theme-dark #copy-paths,
@@ -95,6 +126,10 @@
   }
 
   body.theme-dark #theme-toggle:hover,
+  body.theme-dark #monitor-apply:hover,
+  body.theme-dark #monitor-directory-pick:hover,
+  body.theme-dark #monitor-directory-clear:hover,
+  body.theme-dark #monitor-directory-list:hover,
   body.theme-dark #before-filter-toggle:hover,
   body.theme-dark #select-all-after:hover,
   body.theme-dark #copy-paths:hover,
@@ -102,6 +137,70 @@
   body.theme-dark #center-convert:hover,
   body.theme-dark #center-refresh:hover {
     @apply border-slate-500 bg-slate-600;
+  }
+
+  body.theme-dark #top-header-card .bg-stone-50,
+  body.theme-dark #top-header-card .bg-white,
+  body.theme-dark #top-header-card .bg-white\/90,
+  body.theme-dark #top-monitor-card .bg-stone-50,
+  body.theme-dark #top-monitor-card .bg-white,
+  body.theme-dark #top-monitor-card .bg-white\/90 {
+    @apply bg-slate-800 text-slate-100;
+  }
+
+  body.theme-dark #monitor-directory-label {
+    @apply text-slate-100;
+  }
+
+  body.theme-dark #monitor-activity-count {
+    @apply text-slate-300;
+  }
+
+  body.theme-dark #monitor-status-label {
+    @apply text-slate-300;
+  }
+
+  body.theme-dark #top-header-card .text-stone-400,
+  body.theme-dark #top-monitor-card .text-stone-400 {
+    @apply text-slate-400;
+  }
+
+  body.theme-dark #top-header-card .text-stone-500,
+  body.theme-dark #top-monitor-card .text-stone-500 {
+    @apply text-slate-300;
+  }
+
+  body.theme-dark #top-header-card .text-stone-700,
+  body.theme-dark #top-monitor-card .text-stone-700 {
+    @apply text-slate-100;
+  }
+
+  body.theme-dark #top-header-card .border-stone-200,
+  body.theme-dark #top-header-card .border-stone-200\/80,
+  body.theme-dark #top-header-card .border-stone-300,
+  body.theme-dark #top-monitor-card .border-stone-200,
+  body.theme-dark #top-monitor-card .border-stone-200\/80,
+  body.theme-dark #top-monitor-card .border-stone-300 {
+    @apply border-slate-600;
+  }
+
+  body.theme-dark #monitor-apply {
+    @apply border-violet-500/70 bg-violet-900/40 text-violet-200;
+  }
+
+  body.theme-dark #monitor-apply:hover {
+    @apply border-violet-400 bg-violet-800/50;
+  }
+
+  body.theme-dark #monitor-apply:disabled,
+  body.theme-dark #monitor-directory-pick:disabled,
+  body.theme-dark #monitor-directory-clear:disabled {
+    @apply border-slate-700 bg-slate-800 text-slate-500;
+  }
+
+  body.theme-dark #monitor-activity-indicator {
+    @apply border-slate-500/80 ring-slate-800/90;
+    box-shadow: 0 0 0 1px rgba(148, 163, 184, 0.16);
   }
 
   body.theme-dark #copy-toast,
@@ -133,9 +232,107 @@
     @apply text-slate-200;
   }
 
+  #copy-toast-title {
+    @apply text-sky-700;
+  }
+
+  #copy-toast-list {
+    @apply text-stone-700;
+  }
+
+  #copy-toast .toast-tail {
+    @apply text-stone-500;
+  }
+
+  #copy-toast.toast-success {
+    @apply border-sky-300 bg-sky-50 text-sky-950;
+    box-shadow: 0 22px 50px rgba(14, 116, 144, 0.18), 0 10px 24px rgba(14, 116, 144, 0.1);
+  }
+
+  #copy-toast.toast-success #copy-toast-title {
+    @apply text-sky-700;
+  }
+
+  #copy-toast.toast-success #copy-toast-list {
+    @apply text-sky-900;
+  }
+
+  #copy-toast.toast-success .toast-tail {
+    @apply text-sky-600;
+  }
+
+  #copy-toast.toast-error {
+    @apply border-rose-300 bg-rose-50 text-rose-950;
+    box-shadow: 0 22px 50px rgba(190, 24, 93, 0.18), 0 10px 24px rgba(190, 24, 93, 0.1);
+  }
+
+  #copy-toast.toast-error #copy-toast-title {
+    @apply text-rose-700;
+  }
+
+  #copy-toast.toast-error #copy-toast-list {
+    @apply text-rose-900;
+  }
+
+  #copy-toast.toast-error .toast-tail {
+    @apply text-rose-600;
+  }
+
+  body.theme-dark #copy-toast.toast-success {
+    @apply border-sky-500/70 bg-sky-950/90 text-sky-100;
+    box-shadow: 0 22px 50px rgba(2, 132, 199, 0.28), 0 10px 24px rgba(2, 132, 199, 0.14);
+  }
+
+  body.theme-dark #copy-toast.toast-success #copy-toast-title {
+    @apply text-sky-300;
+  }
+
+  body.theme-dark #copy-toast.toast-success #copy-toast-list {
+    @apply text-sky-100;
+  }
+
+  body.theme-dark #copy-toast.toast-success .toast-tail {
+    @apply text-sky-300;
+  }
+
+  body.theme-dark #copy-toast.toast-error {
+    @apply border-rose-500/70 bg-rose-950/90 text-rose-100;
+    box-shadow: 0 22px 50px rgba(225, 29, 72, 0.28), 0 10px 24px rgba(225, 29, 72, 0.14);
+  }
+
+  body.theme-dark #copy-toast.toast-error #copy-toast-title {
+    @apply text-rose-300;
+  }
+
+  body.theme-dark #copy-toast.toast-error #copy-toast-list {
+    @apply text-rose-100;
+  }
+
+  body.theme-dark #copy-toast.toast-error .toast-tail {
+    @apply text-rose-300;
+  }
+
   body.theme-dark .before-card:not(.border-sky-300),
   body.theme-dark .after-card:not(.border-sky-300) {
     @apply border-slate-600 bg-slate-800 text-slate-100;
+  }
+
+  body.theme-dark .after-convert-source-bg {
+    @apply border-emerald-500/70 bg-emerald-900/35 text-emerald-200;
+  }
+
+  body.theme-dark .after-convert-source-manual {
+    @apply border-sky-500/70 bg-sky-900/35 text-sky-200;
+  }
+
+  body.theme-dark .before-card.nfd-card,
+  body.theme-dark .after-card.nfd-card {
+    @apply border-slate-500 bg-slate-700 text-slate-100;
+  }
+
+  body.theme-dark .before-card.nfc-card,
+  body.theme-dark .after-card.nfc-card {
+    @apply border-slate-700 bg-slate-800 text-slate-100;
   }
 
   body.theme-dark .before-card p.text-stone-800,
@@ -163,6 +360,28 @@
   body.theme-dark .before-card.border-sky-300,
   body.theme-dark .after-card.border-sky-300 {
     @apply border-sky-500 bg-sky-900/30 text-slate-100;
+  }
+
+  body.theme-dark .before-card.border-violet-500,
+  body.theme-dark .after-card.border-violet-500 {
+    @apply border-violet-400 bg-violet-900/55 text-violet-50;
+    box-shadow: inset 0 0 0 1px rgba(196, 181, 253, 0.22);
+  }
+
+  body.theme-dark .before-card.border-violet-500 p.text-stone-800,
+  body.theme-dark .after-card.border-violet-500 p.text-stone-800 {
+    @apply text-violet-50;
+  }
+
+  body.theme-dark .before-card.border-violet-500 p.text-stone-500,
+  body.theme-dark .before-card.border-violet-500 p.text-stone-400,
+  body.theme-dark .after-card.border-violet-500 p.text-stone-500,
+  body.theme-dark .after-card.border-violet-500 p.text-stone-400 {
+    @apply text-violet-200;
+  }
+
+  body.theme-dark .before-card.border-violet-500 .before-remove-button {
+    @apply text-violet-200 hover:text-violet-50;
   }
 
   body.theme-dark .before-remove-button {
@@ -217,6 +436,21 @@
     box-shadow: inset 0 0 0 1px rgba(56, 189, 248, 0.45);
     pointer-events: none;
     z-index: 80;
+  }
+
+  .before-section-drop-active {
+    position: relative;
+  }
+
+  .before-section-drop-overlay {
+    position: absolute;
+    inset: 0;
+    border-radius: 1rem;
+    border: 1px dashed rgb(56 189 248 / 0.95);
+    background-color: rgb(224 242 254 / 0.5);
+    box-shadow: inset 0 0 0 1px rgba(56, 189, 248, 0.45);
+    pointer-events: auto;
+    z-index: 90;
   }
 
   .dropzone-busy {

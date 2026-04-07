@@ -1,67 +1,85 @@
 import "./styles.css";
-import { desktopBridge } from "./desktopBridge";
-
-type NormalizeResult = {
-  sourcePath: string;
-  outputPath: string;
-  sourceName: string;
-  outputName: string;
-  sourceNormalization: "NFC" | "NFD" | "BOTH" | "MIXED";
-  changed: boolean;
-  collisionResolved: boolean;
-};
-
-type NormalizeProgress = {
-  processed: number;
-  total: number;
-};
-
-type InspectProgress = {
-  fileCount: number;
-};
-
-type BeforeItem = {
-  sourcePath: string;
-  sourceName: string;
-  sourceNormalization: NormalizeResult["sourceNormalization"];
-  changed: boolean;
-  isDirectory: boolean;
-  folderFileCount: number;
-  parentFolderPath: string | null;
-};
+import pretendardStylesheetUrl from "pretendard/dist/web/variable/pretendardvariable-dynamic-subset.css?url";
+import heroDocumentArrowUp from "./icons/hero/document-arrow-up.svg?raw";
+import heroSun from "./icons/hero/sun.svg?raw";
+import heroMoon from "./icons/hero/moon.svg?raw";
+import heroChevronDown from "./icons/hero/chevron-down.svg?raw";
+import heroMagnifyingGlass from "./icons/hero/magnifying-glass.svg?raw";
+import heroFolderPlus from "./icons/hero/folder-plus.svg?raw";
+import heroFolderMinus from "./icons/hero/folder-minus.svg?raw";
+import heroArrowRight from "./icons/hero/arrow-right.svg?raw";
+import heroArrowPath from "./icons/hero/arrow-path.svg?raw";
+import heroCheckCircle from "./icons/hero/check-circle.svg?raw";
+import heroLink from "./icons/hero/link.svg?raw";
+import heroDocumentDuplicate from "./icons/hero/document-duplicate.svg?raw";
+import heroFolder from "./icons/hero/folder.svg?raw";
+import heroSparkles from "./icons/hero/sparkles.svg?raw";
+import heroWindow from "./icons/hero/window.svg?raw";
+import heroXMark from "./icons/hero/x-mark.svg?raw";
+import {
+  desktopBridge,
+  type DesktopBridge,
+  type BeforeItem as RawBeforeItem,
+  type InspectProgress,
+  type PickedMonitorDirectory,
+  type MonitorStateEntry,
+  type MonitorSnapshotEntry,
+  type NormalizeProgress,
+  type NormalizeResult as RawNormalizeResult
+} from "./desktopBridge";
+import {
+  AUTO_MONITOR_CONVERT_STORAGE_KEY,
+  AUTO_CONVERT_FILES_STORAGE_KEY,
+  LIST_CLASS,
+  LIST_CLASS_EMPTY,
+  LIST_CLASS_VIRTUAL,
+  MONITOR_SNAPSHOT_CHECK_INTERVAL_MS,
+  MONITOR_SNAPSHOT_STALE_MS,
+  MONITOR_START_DELAY_MS,
+  MONITOR_WATCH_DEBOUNCE_MS,
+  SELECTED_CARD_CLASSES,
+  THEME_STORAGE_KEY,
+  VIRTUAL_LIST_THRESHOLD,
+  VIRTUAL_OVERSCAN,
+  VIRTUAL_ROW_HEIGHT
+} from "./constants";
+import type {
+  AppState,
+  BeforeItem,
+  MonitorBaseline,
+  MonitorDirectoryInfo,
+  NormalizeResult,
+  StatusTone
+} from "./types";
+import {
+  buildMonitorBaseline,
+  collapseMonitorChangedPaths,
+  collapseMonitorPendingEntries,
+  dedupeMonitorEntriesByPath,
+  getMonitorCandidateEntries,
+  replaceMonitorBaselineEntries
+} from "./utils/monitor";
+import {
+  escapeHtml,
+  escapeHtmlAttribute,
+  formatSnapshotTime,
+  getDirectoryPath,
+  getErrorMessage,
+  isPathInFolderTree,
+  normalizePathForCompare,
+  toCompactPath,
+  toMonitorPermissionGuidance
+} from "./utils/path";
 
 declare global {
   interface Window {
-    desktopBridge: {
-      normalizeFileNames(filePaths: string[]): Promise<NormalizeResult[]>;
-      pickFiles(): Promise<string[]>;
-      inspectSourceFiles(filePaths: string[]): Promise<BeforeItem[]>;
-      getPathForFile(file: File): string;
-      openItem(filePath: string): Promise<void>;
-      showItemInFolder(filePath: string): Promise<void>;
-      copyFilesToClipboard(filePaths: string[]): Promise<{
-        copiedCount: number;
-        mode: "file" | "text" | "none";
-        reason?: string;
-        requestedCount: number;
-        missingCount: number;
-        missingPaths?: string[];
-        errorCode?: string;
-        errorMessage?: string;
-      }>;
-      copyPathTextToClipboard(filePaths: string[]): Promise<{ copiedCount: number }>;
-      onInspectProgress(listener: (progress: InspectProgress) => void): Promise<() => void>;
-      onInspectBatch(listener: (items: BeforeItem[]) => void): Promise<() => void>;
-      onNormalizeProgress(listener: (progress: NormalizeProgress) => void): Promise<() => void>;
-      onNormalizeItem(listener: (item: NormalizeResult) => void): Promise<() => void>;
-      startFileDrag(filePaths: string[]): Promise<void>;
-    };
+    desktopBridge: DesktopBridge;
   }
 }
 
 window.desktopBridge = desktopBridge;
 
-const state = {
+const state: AppState = {
   beforeItems: [] as BeforeItem[],
   selectedBeforePaths: new Set<string>(),
   beforeNfdOnly: false,
@@ -75,18 +93,46 @@ const state = {
   beforeDragHoverTimerId: 0,
   afterInternalDragActive: false,
   busy: false,
-  darkMode: false
+  darkMode: false,
+  mainWindowVisible: true,
+  monitorDirectoryPaths: [] as string[],
+  monitorPendingPaths: new Set<string>(),
+  monitorPendingFileCount: 0,
+  monitorPendingDirectoryCount: 0,
+  monitorProgressMessage: "",
+  launchAtLoginEnabled: false,
+  autoMonitorConvertEnabled: false,
+  autoConvertFilesEnabled: false,
+  monitorAutoConvertRunning: false
 };
-const SELECTED_CARD_CLASSES = ["border-sky-300", "bg-sky-100/60", "text-stone-900", "shadow-sm", "shadow-sky-100"];
-const LIST_CLASS =
-  "scroll-fade relative grid content-start auto-rows-max h-[460px] max-h-[460px] min-h-[460px] gap-2 overflow-y-auto overflow-x-hidden pl-2 pr-4 py-2 [scrollbar-gutter:stable]";
-const LIST_CLASS_EMPTY =
-  "scroll-fade relative grid content-start auto-rows-max h-[460px] max-h-[460px] min-h-[460px] gap-2 overflow-y-auto overflow-x-hidden pl-0 pr-0 py-0 [scrollbar-gutter:stable]";
-const LIST_CLASS_VIRTUAL =
-  "virtual-list-host scroll-fade relative h-[460px] max-h-[460px] min-h-[460px] overflow-y-auto overflow-x-hidden pl-2 pr-4 py-2 [scrollbar-gutter:stable]";
-const VIRTUAL_LIST_THRESHOLD = 300;
-const VIRTUAL_ROW_HEIGHT = 57;
-const VIRTUAL_OVERSCAN = 32;
+
+function asHeroIcon(svgRaw: string, className: string) {
+  return svgRaw
+    .replace("<svg", `<svg aria-hidden="true" class="${className}"`)
+    .replace(/<\/?title[^>]*>/g, "")
+    .replace(/\s{2,}/g, " ")
+    .trim();
+}
+
+const ICON_APP = asHeroIcon(heroDocumentArrowUp, "h-6 w-6");
+const ICON_THEME_SUN = asHeroIcon(heroSun, "h-[22px] w-[22px]");
+const ICON_THEME_MOON = asHeroIcon(heroMoon, "h-[22px] w-[22px]");
+const ICON_CHEVRON_DOWN = asHeroIcon(
+  heroChevronDown,
+  "pointer-events-none absolute right-2 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-stone-400"
+);
+const ICON_MONITOR_APPLY = asHeroIcon(heroMagnifyingGlass, "h-[18px] w-[18px] shrink-0");
+const ICON_MONITOR_ADD = asHeroIcon(heroFolderPlus, "h-[18px] w-[18px] shrink-0");
+const ICON_MONITOR_REMOVE = asHeroIcon(heroFolderMinus, "h-[18px] w-[18px] shrink-0");
+const ICON_CENTER_CONVERT = asHeroIcon(heroArrowRight, "h-[22px] w-[22px]");
+const ICON_CENTER_REFRESH = asHeroIcon(heroArrowPath, "h-[22px] w-[22px]");
+const ICON_SELECT_ALL = asHeroIcon(heroCheckCircle, "h-[18px] w-[18px] shrink-0");
+const ICON_COPY_PATHS = asHeroIcon(heroLink, "h-[18px] w-[18px] shrink-0");
+const ICON_COPY_FILES = asHeroIcon(heroDocumentDuplicate, "h-[18px] w-[18px] shrink-0");
+const ICON_FOLDER_CHIP = asHeroIcon(heroFolder, "h-3.5 w-3.5");
+const ICON_NFD_CHIP = asHeroIcon(heroSparkles, "h-3.5 w-3.5");
+const ICON_NFC_CHIP = asHeroIcon(heroWindow, "h-3.5 w-3.5");
+const ICON_REMOVE = asHeroIcon(heroXMark, "h-3 w-3");
 
 const app = document.querySelector<HTMLDivElement>("#app");
 
@@ -96,22 +142,109 @@ if (!app) {
 
 app.innerHTML = `
   <main class="flex h-full w-full flex-col gap-3 overflow-hidden p-3">
-    <section id="top-section" class="rounded-2xl border border-stone-200/80 bg-white/90 p-4 shadow-soft backdrop-blur">
-      <div class="mb-2 flex items-center justify-between gap-3">
-        <h1 class="text-xl font-extrabold tracking-tight text-stone-900 sm:text-2xl">File Path Renamer (NFD -> NFC)</h1>
-        <button
-          id="theme-toggle"
-          class="inline-flex h-8 w-8 items-center justify-center rounded-md border border-stone-300 bg-stone-50 text-stone-700 transition hover:border-stone-400 hover:bg-stone-100"
-          type="button"
-          aria-pressed="false"
-          aria-label="다크 모드 켜기"
-          title="다크 모드 켜기"
-        >
-          <svg viewBox="0 0 20 20" aria-hidden="true" class="h-4 w-4 fill-none stroke-current stroke-[1.8]">
-            <circle cx="10" cy="10" r="3.5" />
-            <path d="M10 2.5v2M10 15.5v2M2.5 10h2M15.5 10h2M4.7 4.7l1.4 1.4M13.9 13.9l1.4 1.4M15.3 4.7l-1.4 1.4M6.1 13.9l-1.4 1.4" stroke-linecap="round" />
-          </svg>
-        </button>
+    <section id="top-header-card" class="rounded-2xl border border-stone-200/80 bg-white/90 p-4 shadow-soft backdrop-blur">
+      <div class="flex items-center justify-between gap-3">
+        <div class="flex min-w-0 items-center gap-3">
+          <div class="flex h-11 w-11 shrink-0 items-center justify-center rounded-2xl border border-sky-200/80 bg-gradient-to-br from-sky-100 via-white to-violet-100 text-sky-700 shadow-sm">
+            ${ICON_APP}
+          </div>
+          <div class="min-w-0">
+            <h1 class="truncate text-xl font-extrabold tracking-tight text-stone-900 sm:text-2xl">File Path Renamer</h1>
+            <p class="mt-0.5 truncate text-[11px] font-medium text-stone-500">macOS에서 한글 경로를 정리해 Windows 호환 첨부 파일로 바꿉니다.</p>
+          </div>
+        </div>
+        <div class="flex items-center gap-2">
+          <div class="flex items-center gap-3">
+            <label class="inline-flex items-center gap-1.5 text-[12px] font-medium text-stone-600">
+              <input id="launch-at-login-toggle" type="checkbox" class="h-4 w-4 rounded border-stone-300 text-violet-600 focus:ring-violet-400" />
+              <span>로그인시 자동 실행</span>
+            </label>
+            <label class="inline-flex items-center gap-1.5 text-[12px] font-medium text-stone-600">
+              <input id="auto-monitor-convert-toggle" type="checkbox" class="h-4 w-4 rounded border-stone-300 text-violet-600 focus:ring-violet-400" />
+              <span>백그라운드 자동 감지</span>
+            </label>
+            <label class="inline-flex items-center gap-1.5 text-[12px] font-medium text-stone-600 ml-1 opacity-100 transition-opacity" id="auto-convert-files-label">
+              <input id="auto-convert-files-toggle" type="checkbox" class="h-4 w-4 rounded border-stone-300 text-violet-600 focus:ring-violet-400 disabled:cursor-not-allowed" />
+              <span>자동 변환</span>
+            </label>
+          </div>
+          <div class="flex items-center gap-2">
+            <button
+              id="theme-toggle"
+              class="inline-flex h-9 w-9 items-center justify-center rounded-md border border-stone-300 bg-stone-50 text-stone-700 transition hover:border-stone-400 hover:bg-stone-100"
+              type="button"
+              aria-pressed="false"
+              aria-label="다크 모드 켜기"
+              title="다크 모드 켜기"
+            >
+              ${ICON_THEME_SUN}
+            </button>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <section id="top-monitor-card" class="rounded-2xl border border-stone-200/80 bg-white/90 p-4 shadow-soft backdrop-blur">
+      <div class="mb-2 flex items-center gap-4">
+        <div class="min-w-0 flex-1">
+          <p class="text-[10px] font-semibold uppercase tracking-[0.16em] text-stone-400">Monitoring</p>
+          <p id="monitor-directory-label" class="truncate text-sm font-semibold text-stone-900">모니터링 디렉토리를 선택해 주세요.</p>
+        </div>
+        <div class="flex shrink-0 items-center justify-end gap-2">
+          <span
+            id="monitor-activity-count"
+            class="inline-flex min-w-[88px] items-center justify-end text-right text-[12px] font-semibold tabular-nums text-stone-500"
+            aria-hidden="true"
+          >대기중</span>
+          <span
+            id="monitor-activity-indicator"
+            class="inline-flex h-3.5 w-3.5 shrink-0 rounded-full border border-stone-400/70 bg-stone-300 ring-2 ring-white/70"
+            aria-label="모니터링 백그라운드 작업 없음"
+            title="모니터링 백그라운드 작업 없음"
+          ></span>
+          <div class="relative">
+            <select
+              id="monitor-directory-list"
+              class="h-9 min-w-[340px] max-w-[420px] appearance-none rounded-md border border-stone-300 bg-white pl-3 pr-8 text-[12px] font-medium leading-none text-stone-700 transition hover:border-stone-400"
+            ></select>
+            ${ICON_CHEVRON_DOWN}
+          </div>
+          <button
+            id="monitor-apply"
+            class="relative inline-flex h-9 items-center gap-2 whitespace-nowrap rounded-md border border-violet-300 bg-violet-50 px-3 text-[12px] font-medium text-violet-700 transition hover:border-violet-400 hover:bg-violet-100 disabled:cursor-not-allowed disabled:border-stone-200 disabled:bg-stone-50 disabled:text-stone-300"
+            type="button"
+            aria-label="변환 대상 찾기"
+            title="변환 대상 찾기"
+            disabled
+          >
+            ${ICON_MONITOR_APPLY}
+            <span id="monitor-apply-label">변환 대상 찾기</span>
+            <span
+              id="monitor-apply-badge"
+              class="absolute -right-1 -top-1 hidden min-w-4 rounded-full bg-violet-600 px-1 text-center text-[10px] font-semibold leading-4 text-white"
+            ></span>
+          </button>
+          <button
+            id="monitor-directory-pick"
+            class="inline-flex h-9 items-center gap-2 whitespace-nowrap rounded-md border border-stone-300 bg-white px-3 text-[12px] font-medium text-stone-700 transition hover:border-stone-400 hover:bg-stone-100"
+            type="button"
+            aria-label="모니터링 추가"
+            title="모니터링 추가"
+          >
+            ${ICON_MONITOR_ADD}
+            <span>모니터링 추가</span>
+          </button>
+          <button
+            id="monitor-directory-clear"
+            class="inline-flex h-9 items-center gap-2 whitespace-nowrap rounded-md border border-stone-300 bg-white px-3 text-[12px] font-medium text-stone-700 transition hover:border-stone-400 hover:bg-stone-100 disabled:cursor-not-allowed disabled:opacity-40"
+            type="button"
+            aria-label="모니터링 해제"
+            title="모니터링 해제"
+          >
+            ${ICON_MONITOR_REMOVE}
+            <span>모니터링 해제</span>
+          </button>
+        </div>
       </div>
       <div>
         <p id="status-text" class="status-idle hidden h-0 text-xs leading-5">아직 처리된 파일이 없습니다.</p>
@@ -119,19 +252,6 @@ app.innerHTML = `
           id="status-log"
           class="h-20 overflow-y-auto rounded-md border border-stone-200 bg-white px-2 py-1 text-[11px] leading-4 text-stone-600"
         ></div>
-        <div id="progress-wrap" class="mt-2 h-8">
-          <div class="flex items-center justify-between text-[11px] text-stone-500">
-            <span id="progress-label">작업 대기 중...</span>
-            <span id="progress-percent"></span>
-          </div>
-          <div id="progress-track" class="mt-1 hidden h-2 w-full overflow-hidden rounded-full bg-stone-200">
-            <div
-              id="progress-bar"
-              class="h-full w-full origin-left rounded-full bg-stone-700 transition-transform duration-200 ease-out"
-              style="transform: scaleX(0)"
-            ></div>
-          </div>
-        </div>
       </div>
     </section>
 
@@ -139,15 +259,16 @@ app.innerHTML = `
       <div class="absolute left-1/2 top-1/2 z-20 flex -translate-x-1/2 -translate-y-1/2 flex-col items-center gap-2">
         <button
           id="center-convert"
-          class="inline-flex h-9 w-9 items-center justify-center rounded-full border border-stone-300 bg-white text-sm font-semibold text-stone-600 shadow transition hover:border-stone-400 hover:bg-stone-100 disabled:cursor-not-allowed disabled:border-stone-100 disabled:bg-stone-50 disabled:text-stone-200"
+          class="relative inline-flex h-9 w-9 items-center justify-center rounded-full border border-stone-300 bg-white text-sm font-semibold text-stone-600 shadow transition hover:border-stone-400 hover:bg-stone-100 disabled:cursor-not-allowed disabled:border-stone-100 disabled:bg-stone-50 disabled:text-stone-200"
           type="button"
           aria-label="before 변환 실행"
           title="변환"
         >
-          <svg viewBox="0 0 20 20" aria-hidden="true" class="h-5 w-5 fill-none stroke-current stroke-[2.2]">
-            <path d="M3.5 10h12" stroke-linecap="round" />
-            <path d="M11.4 6.6 16.2 10l-4.8 3.4" stroke-linecap="round" stroke-linejoin="round" />
-          </svg>
+          <span
+            id="center-convert-badge"
+            class="pointer-events-none absolute -right-1 -top-1 hidden min-w-4 rounded-full bg-violet-600 px-1 py-0.5 text-[9px] font-semibold leading-none text-white"
+          ></span>
+          ${ICON_CENTER_CONVERT}
         </button>
         <button
           id="center-refresh"
@@ -156,36 +277,35 @@ app.innerHTML = `
           aria-label="before/after 전체 초기화"
           title="전체 초기화"
         >
-          <svg viewBox="0 0 20 20" aria-hidden="true" class="h-5 w-5 fill-none stroke-current stroke-[2.2]">
-            <path d="M16.5 10a6.5 6.5 0 1 1-2-4.6" stroke-linecap="round" />
-            <path d="M16 3.4v3.9h-3.9" stroke-linecap="round" stroke-linejoin="round" />
-          </svg>
+          ${ICON_CENTER_REFRESH}
         </button>
       </div>
       <section id="before-section" class="relative rounded-2xl border border-stone-200/80 bg-white/90 p-4 shadow-soft backdrop-blur">
         <div class="mb-3 flex items-start justify-between gap-3">
           <div>
-            <p class="text-[11px] font-semibold uppercase tracking-[0.18em] text-stone-400">Before</p>
+            <p class="text-[12px] font-semibold uppercase tracking-[0.18em] text-stone-400">Before</p>
             <h2 class="flex items-center gap-2 text-sm font-semibold text-stone-900">
               원본 파일 목록
-              <span id="before-count" class="text-xs font-medium text-stone-400">(0개)</span>
+              <span id="before-count" class="text-[12px] font-medium text-stone-400">(0개)</span>
             </h2>
           </div>
           <button
             id="before-filter-toggle"
-            class="inline-flex items-center gap-2 self-end whitespace-nowrap rounded-md border border-stone-300 bg-stone-50 px-3 py-1.5 text-[11px] font-medium text-stone-700 transition hover:border-stone-400 hover:bg-stone-100"
+            class="inline-flex items-center gap-2 self-end whitespace-nowrap rounded-md border border-stone-300 bg-stone-50 px-3 py-1.5 text-[12px] font-medium text-stone-700 transition hover:border-stone-400 hover:bg-stone-100"
             type="button"
             aria-pressed="false"
+            aria-label="NFD만 보기"
+            title="NFD만 보기"
           >
-            <span class="text-[11px]">전체 보기</span>
+            <span class="text-[12px]">전체 보기</span>
             <span id="before-filter-toggle-pill" class="relative inline-flex h-4 w-9 rounded-full bg-stone-300 transition-colors">
               <span id="before-filter-toggle-knob" class="absolute left-0.5 top-0.5 h-3 w-3 rounded-full bg-white shadow-sm transition-transform"></span>
             </span>
-            <span id="before-filter-toggle-text" class="text-left text-[10px]">NFD만 보기</span>
+            <span id="before-filter-toggle-text" class="text-left text-[12px]">NFD만 보기</span>
           </button>
         </div>
         <div id="before-list-host" class="relative h-[460px] overflow-hidden rounded-2xl">
-          <div id="before-list" class="grid content-start auto-rows-max h-[460px] max-h-[460px] min-h-[460px] gap-2 overflow-y-auto overflow-x-hidden pl-0 pr-0 py-0 [scrollbar-gutter:stable]">
+          <div id="before-list" class="grid content-start auto-rows-max h-[460px] max-h-[460px] min-h-[460px] gap-1 overflow-y-auto overflow-x-hidden pl-0 pr-0 py-0 [scrollbar-gutter:stable]">
             <div class="flex h-[444px] min-h-[444px] items-center justify-center rounded-2xl border border-dashed border-stone-200 bg-stone-50 px-4 text-center text-sm text-stone-400">
               원본 파일 목록이 여기에 표시됩니다.
             </div>
@@ -196,42 +316,67 @@ app.innerHTML = `
       <section id="after-section" class="relative rounded-2xl border border-stone-200/80 bg-white/90 p-4 shadow-soft backdrop-blur">
         <div class="mb-3 flex items-start justify-between gap-3">
           <div>
-            <p class="text-[11px] font-semibold uppercase tracking-[0.18em] text-stone-400">After</p>
+            <p class="text-[12px] font-semibold uppercase tracking-[0.18em] text-stone-400">After</p>
             <h2 class="flex items-center gap-2 text-sm font-semibold text-stone-900">
               변환된 파일 목록
-              <span id="after-count" class="text-xs font-medium text-stone-400">(0개)</span>
+              <span id="after-count" class="text-[12px] font-medium text-stone-400">(0개)</span>
             </h2>
           </div>
           <div class="flex items-center gap-2 self-end">
             <button
               id="select-all-after"
-              class="inline-flex items-center whitespace-nowrap rounded-md border border-stone-300 bg-stone-50 px-3 py-1.5 text-[11px] font-medium text-stone-700 transition hover:border-stone-400 hover:bg-stone-100 disabled:cursor-not-allowed disabled:opacity-50"
+              class="inline-flex h-9 items-center gap-2 whitespace-nowrap rounded-md border border-stone-300 bg-stone-50 px-3 text-[12px] font-medium text-stone-700 transition hover:border-stone-400 hover:bg-stone-100 disabled:cursor-not-allowed disabled:opacity-50"
               type="button"
+              aria-label="전체 선택"
+              title="전체 선택"
             >
-              전체선택
+              ${ICON_SELECT_ALL}
+              <span id="select-all-after-label">전체 선택</span>
             </button>
             <button
               id="copy-paths"
-              class="inline-flex items-center whitespace-nowrap rounded-md border border-stone-300 bg-stone-50 px-3 py-1.5 text-[11px] font-medium text-stone-700 transition hover:border-stone-400 hover:bg-stone-100 disabled:cursor-not-allowed disabled:opacity-50"
+              class="inline-flex h-9 items-center gap-2 whitespace-nowrap rounded-md border border-stone-300 bg-stone-50 px-3 text-[12px] font-medium text-stone-700 transition hover:border-stone-400 hover:bg-stone-100 disabled:cursor-not-allowed disabled:opacity-50"
               type="button"
+              aria-label="경로 복사"
+              title="경로 복사"
             >
-              경로 복사
+              ${ICON_COPY_PATHS}
+              <span>경로 복사</span>
             </button>
             <button
               id="copy-selection"
-              class="inline-flex items-center whitespace-nowrap rounded-md border border-stone-300 bg-stone-50 px-3 py-1.5 text-[11px] font-medium text-stone-700 transition hover:border-stone-400 hover:bg-stone-100 disabled:cursor-not-allowed disabled:opacity-50"
+              class="inline-flex h-9 items-center gap-2 whitespace-nowrap rounded-md border border-stone-300 bg-stone-50 px-3 text-[12px] font-medium text-stone-700 transition hover:border-stone-400 hover:bg-stone-100 disabled:cursor-not-allowed disabled:opacity-50"
               type="button"
+              aria-label="파일 복사"
+              title="파일 복사"
             >
-              파일 복사
+              ${ICON_COPY_FILES}
+              <span>파일 복사</span>
             </button>
           </div>
         </div>
-        <div id="after-list" class="grid content-start auto-rows-max h-[460px] max-h-[460px] min-h-[460px] gap-2 overflow-y-auto overflow-x-hidden pl-0 pr-0 py-0 [scrollbar-gutter:stable]">
+        <div id="after-list" class="grid content-start auto-rows-max h-[460px] max-h-[460px] min-h-[460px] gap-1 overflow-y-auto overflow-x-hidden pl-0 pr-0 py-0 [scrollbar-gutter:stable]">
           <div class="flex h-[444px] min-h-[444px] items-center justify-center rounded-2xl border border-dashed border-stone-200 bg-stone-50 px-4 text-center text-sm text-stone-400">
             변환된 파일 목록이 여기에 표시됩니다.
           </div>
         </div>
       </section>
+    </section>
+
+    <section id="convert-progress-card" class="rounded-2xl border border-stone-200/80 bg-white/90 px-4 py-3 shadow-soft backdrop-blur">
+      <div id="progress-wrap" class="h-8">
+        <div class="flex items-center justify-between text-[11px] text-stone-500">
+          <span id="progress-label">작업 대기 중...</span>
+          <span id="progress-percent"></span>
+        </div>
+        <div id="progress-track" class="mt-1 hidden h-2 w-full overflow-hidden rounded-full bg-stone-200">
+          <div
+            id="progress-bar"
+            class="h-full w-full origin-left rounded-full bg-stone-700 transition-transform duration-200 ease-out"
+            style="transform: scaleX(0)"
+          ></div>
+        </div>
+      </div>
     </section>
   </main>
   <div
@@ -242,7 +387,7 @@ app.innerHTML = `
   >
     <button
       id="after-context-select-all"
-      class="flex w-full items-center rounded px-2 py-1.5 text-left text-xs text-stone-700 transition hover:bg-stone-100 disabled:cursor-not-allowed disabled:opacity-40"
+      class="flex w-full items-center rounded px-2 py-1.5 text-left text-[12px] text-stone-700 transition hover:bg-stone-100 disabled:cursor-not-allowed disabled:opacity-40"
       type="button"
       role="menuitem"
     >
@@ -250,7 +395,7 @@ app.innerHTML = `
     </button>
     <button
       id="after-context-copy-paths"
-      class="mt-0.5 flex w-full items-center rounded px-2 py-1.5 text-left text-xs text-stone-700 transition hover:bg-stone-100 disabled:cursor-not-allowed disabled:opacity-40"
+      class="mt-0.5 flex w-full items-center rounded px-2 py-1.5 text-left text-[12px] text-stone-700 transition hover:bg-stone-100 disabled:cursor-not-allowed disabled:opacity-40"
       type="button"
       role="menuitem"
     >
@@ -258,7 +403,7 @@ app.innerHTML = `
     </button>
     <button
       id="after-context-copy-files"
-      class="mt-0.5 flex w-full items-center rounded px-2 py-1.5 text-left text-xs text-stone-700 transition hover:bg-stone-100 disabled:cursor-not-allowed disabled:opacity-40"
+      class="mt-0.5 flex w-full items-center rounded px-2 py-1.5 text-left text-[12px] text-stone-700 transition hover:bg-stone-100 disabled:cursor-not-allowed disabled:opacity-40"
       type="button"
       role="menuitem"
     >
@@ -270,8 +415,8 @@ app.innerHTML = `
     class="pointer-events-none fixed bottom-3 right-3 z-[150] hidden w-[min(380px,calc(100vw-1.5rem))] rounded-xl border border-sky-200 bg-white p-3 shadow-[0_18px_42px_rgba(15,23,42,0.18),0_6px_16px_rgba(15,23,42,0.1)]"
     aria-live="polite"
   >
-    <p id="copy-toast-title" class="text-xs font-semibold text-sky-700"></p>
-    <div id="copy-toast-list" class="mt-1 max-h-36 overflow-y-auto text-[11px] leading-4 text-stone-700"></div>
+    <p id="copy-toast-title" class="text-[12px] font-semibold"></p>
+    <div id="copy-toast-list" class="mt-1 max-h-36 overflow-y-auto text-[12px] leading-4"></div>
   </div>
   <div
     id="before-context-menu"
@@ -281,7 +426,7 @@ app.innerHTML = `
   >
     <button
       id="before-context-convert"
-      class="flex w-full items-center rounded px-2 py-1.5 text-left text-xs text-stone-700 transition hover:bg-stone-100 disabled:cursor-not-allowed disabled:opacity-40"
+      class="flex w-full items-center rounded px-2 py-1.5 text-left text-[12px] text-stone-700 transition hover:bg-stone-100 disabled:cursor-not-allowed disabled:opacity-40"
       type="button"
       role="menuitem"
     >
@@ -289,51 +434,79 @@ app.innerHTML = `
     </button>
     <button
       id="before-context-clear"
-      class="mt-0.5 flex w-full items-center rounded px-2 py-1.5 text-left text-xs text-stone-700 transition hover:bg-stone-100 disabled:cursor-not-allowed disabled:opacity-40"
+      class="mt-0.5 flex w-full items-center rounded px-2 py-1.5 text-left text-[12px] text-stone-700 transition hover:bg-stone-100 disabled:cursor-not-allowed disabled:opacity-40"
       type="button"
       role="menuitem"
     >
       전체 삭제
     </button>
   </div>
+  <div
+    id="app-loading-overlay"
+    class="pointer-events-none fixed inset-0 z-[160] hidden items-center justify-center bg-stone-900/18 backdrop-blur-[1px]"
+    aria-hidden="true"
+  >
+    <div class="rounded-xl border border-stone-200 bg-white/95 px-4 py-2 shadow-lg">
+      <p id="app-loading-message" class="text-[12px] font-medium text-stone-700">작업을 처리하고 있습니다...</p>
+    </div>
+  </div>
 `;
 
-const beforeList = document.querySelector<HTMLDivElement>("#before-list");
-const beforeListHost = document.querySelector<HTMLDivElement>("#before-list-host");
-const afterList = document.querySelector<HTMLDivElement>("#after-list");
-const statusText = document.querySelector<HTMLParagraphElement>("#status-text");
-const beforeCount = document.querySelector<HTMLSpanElement>("#before-count");
-const beforeFilterToggleButton = document.querySelector<HTMLButtonElement>("#before-filter-toggle");
-const beforeFilterTogglePill = document.querySelector<HTMLSpanElement>("#before-filter-toggle-pill");
-const beforeFilterToggleKnob = document.querySelector<HTMLSpanElement>("#before-filter-toggle-knob");
-const beforeFilterToggleText = document.querySelector<HTMLSpanElement>("#before-filter-toggle-text");
-const afterCount = document.querySelector<HTMLSpanElement>("#after-count");
-const progressWrap = document.querySelector<HTMLDivElement>("#progress-wrap");
-const progressLabel = document.querySelector<HTMLSpanElement>("#progress-label");
-const progressPercent = document.querySelector<HTMLSpanElement>("#progress-percent");
-const progressTrack = document.querySelector<HTMLDivElement>("#progress-track");
-const progressBar = document.querySelector<HTMLDivElement>("#progress-bar");
-const statusLog = document.querySelector<HTMLDivElement>("#status-log");
-const selectAllAfterButton = document.querySelector<HTMLButtonElement>("#select-all-after");
-const copySelectionButton = document.querySelector<HTMLButtonElement>("#copy-selection");
-const copyPathsButton = document.querySelector<HTMLButtonElement>("#copy-paths");
-const centerConvertButton = document.querySelector<HTMLButtonElement>("#center-convert");
-const centerRefreshButton = document.querySelector<HTMLButtonElement>("#center-refresh");
-const afterContextMenu = document.querySelector<HTMLDivElement>("#after-context-menu");
-const afterContextCopyFilesButton = document.querySelector<HTMLButtonElement>("#after-context-copy-files");
-const afterContextSelectAllButton = document.querySelector<HTMLButtonElement>("#after-context-select-all");
-const afterContextCopyPathsButton = document.querySelector<HTMLButtonElement>("#after-context-copy-paths");
-const copyToast = document.querySelector<HTMLDivElement>("#copy-toast");
-const copyToastTitle = document.querySelector<HTMLParagraphElement>("#copy-toast-title");
-const copyToastList = document.querySelector<HTMLDivElement>("#copy-toast-list");
-const beforeContextMenu = document.querySelector<HTMLDivElement>("#before-context-menu");
-const beforeContextConvertButton = document.querySelector<HTMLButtonElement>("#before-context-convert");
-const beforeContextClearButton = document.querySelector<HTMLButtonElement>("#before-context-clear");
-const themeToggleButton = document.querySelector<HTMLButtonElement>("#theme-toggle");
+const beforeList = document.querySelector<HTMLDivElement>("#before-list")!;
+const beforeListHost = document.querySelector<HTMLDivElement>("#before-list-host")!;
+const beforeSection = document.querySelector<HTMLElement>("#before-section")!;
+const afterList = document.querySelector<HTMLDivElement>("#after-list")!;
+const statusText = document.querySelector<HTMLParagraphElement>("#status-text")!;
+const beforeCount = document.querySelector<HTMLSpanElement>("#before-count")!;
+const beforeFilterToggleButton = document.querySelector<HTMLButtonElement>("#before-filter-toggle")!;
+const beforeFilterTogglePill = document.querySelector<HTMLSpanElement>("#before-filter-toggle-pill")!;
+const beforeFilterToggleKnob = document.querySelector<HTMLSpanElement>("#before-filter-toggle-knob")!;
+const beforeFilterToggleText = document.querySelector<HTMLSpanElement>("#before-filter-toggle-text")!;
+const afterCount = document.querySelector<HTMLSpanElement>("#after-count")!;
+const progressWrap = document.querySelector<HTMLDivElement>("#progress-wrap")!;
+const progressLabel = document.querySelector<HTMLSpanElement>("#progress-label")!;
+const progressPercent = document.querySelector<HTMLSpanElement>("#progress-percent")!;
+const progressTrack = document.querySelector<HTMLDivElement>("#progress-track")!;
+const progressBar = document.querySelector<HTMLDivElement>("#progress-bar")!;
+const monitorDirectoryLabel = document.querySelector<HTMLParagraphElement>("#monitor-directory-label")!;
+const monitorDirectoryList = document.querySelector<HTMLSelectElement>("#monitor-directory-list")!;
+const monitorApplyButton = document.querySelector<HTMLButtonElement>("#monitor-apply")!;
+const monitorApplyBadge = document.querySelector<HTMLSpanElement>("#monitor-apply-badge")!;
+const monitorApplyLabel = document.querySelector<HTMLSpanElement>("#monitor-apply-label")!;
+const monitorDirectoryPickButton = document.querySelector<HTMLButtonElement>("#monitor-directory-pick")!;
+const monitorDirectoryClearButton = document.querySelector<HTMLButtonElement>("#monitor-directory-clear")!;
+const monitorActivityIndicator = document.querySelector<HTMLSpanElement>("#monitor-activity-indicator")!;
+const monitorActivityCount = document.querySelector<HTMLSpanElement>("#monitor-activity-count")!;
+const statusLog = document.querySelector<HTMLDivElement>("#status-log")!;
+const launchAtLoginToggle = document.querySelector<HTMLInputElement>("#launch-at-login-toggle")!;
+const autoMonitorConvertToggle = document.querySelector<HTMLInputElement>("#auto-monitor-convert-toggle")!;
+const autoConvertFilesToggle = document.querySelector<HTMLInputElement>("#auto-convert-files-toggle")!;
+const autoConvertFilesLabel = document.querySelector<HTMLLabelElement>("#auto-convert-files-label")!;
+const selectAllAfterButton = document.querySelector<HTMLButtonElement>("#select-all-after")!;
+const selectAllAfterLabel = document.querySelector<HTMLSpanElement>("#select-all-after-label")!;
+const copySelectionButton = document.querySelector<HTMLButtonElement>("#copy-selection")!;
+const copyPathsButton = document.querySelector<HTMLButtonElement>("#copy-paths")!;
+const centerConvertButton = document.querySelector<HTMLButtonElement>("#center-convert")!;
+const centerConvertBadge = document.querySelector<HTMLSpanElement>("#center-convert-badge")!;
+const centerRefreshButton = document.querySelector<HTMLButtonElement>("#center-refresh")!;
+const afterContextMenu = document.querySelector<HTMLDivElement>("#after-context-menu")!;
+const afterContextCopyFilesButton = document.querySelector<HTMLButtonElement>("#after-context-copy-files")!;
+const afterContextSelectAllButton = document.querySelector<HTMLButtonElement>("#after-context-select-all")!;
+const afterContextCopyPathsButton = document.querySelector<HTMLButtonElement>("#after-context-copy-paths")!;
+const copyToast = document.querySelector<HTMLDivElement>("#copy-toast")!;
+const copyToastTitle = document.querySelector<HTMLParagraphElement>("#copy-toast-title")!;
+const copyToastList = document.querySelector<HTMLDivElement>("#copy-toast-list")!;
+const beforeContextMenu = document.querySelector<HTMLDivElement>("#before-context-menu")!;
+const beforeContextConvertButton = document.querySelector<HTMLButtonElement>("#before-context-convert")!;
+const beforeContextClearButton = document.querySelector<HTMLButtonElement>("#before-context-clear")!;
+const themeToggleButton = document.querySelector<HTMLButtonElement>("#theme-toggle")!;
+const appLoadingOverlay = document.querySelector<HTMLDivElement>("#app-loading-overlay")!;
+const appLoadingMessage = document.querySelector<HTMLParagraphElement>("#app-loading-message")!;
 
 if (
   !beforeList ||
   !beforeListHost ||
+  !beforeSection ||
   !afterList ||
   !statusText ||
   !beforeCount ||
@@ -347,11 +520,26 @@ if (
   !progressPercent ||
   !progressTrack ||
   !progressBar ||
+  !monitorDirectoryLabel ||
+  !monitorDirectoryList ||
+  !monitorApplyButton ||
+  !monitorApplyBadge ||
+  !monitorApplyLabel ||
+  !monitorDirectoryPickButton ||
+  !monitorDirectoryClearButton ||
+  !monitorActivityIndicator ||
+  !monitorActivityCount ||
   !statusLog ||
+  !launchAtLoginToggle ||
+  !autoMonitorConvertToggle ||
+  !autoConvertFilesToggle ||
+  !autoConvertFilesLabel ||
   !selectAllAfterButton ||
+  !selectAllAfterLabel ||
   !copySelectionButton ||
   !copyPathsButton ||
   !centerConvertButton ||
+  !centerConvertBadge ||
   !centerRefreshButton ||
   !afterContextMenu ||
   !afterContextCopyFilesButton ||
@@ -363,7 +551,9 @@ if (
   !beforeContextMenu ||
   !beforeContextConvertButton ||
   !beforeContextClearButton ||
-  !themeToggleButton
+  !themeToggleButton ||
+  !appLoadingOverlay ||
+  !appLoadingMessage
 ) {
   throw new Error("Failed to initialize UI.");
 }
@@ -372,25 +562,190 @@ beforeList.dataset.loadingLabel = "로딩중...";
 afterList.dataset.loadingLabel = "로딩중...";
 
 let copyToastTimerId = 0;
+let lastTaskToastMessage = "";
+let lastTaskToastAt = 0;
 const afterCardElementMap = new Map<string, HTMLElement>();
 const resultIndexBySourcePath = new Map<string, number>();
 const resultIndexByOutputPath = new Map<string, number>();
-const beforeRenderMetaCache = new Map<string, { displayName: string; compactPath: string; title: string }>();
-const afterRenderMetaCache = new Map<string, { displayName: string; compactPath: string }>();
-const pendingNormalizeItems: NormalizeResult[] = [];
-const pendingInspectItems: BeforeItem[] = [];
-let normalizeFlushRafId = 0;
-let inspectFlushTimerId = 0;
-let inspectOverlayRafId = 0;
 let latestInspectFileCount = 0;
 let beforeScrollRafId = 0;
 let afterScrollRafId = 0;
 let currentBeforeVisibleEntries: Array<{ item: BeforeItem; originalIndex: number }> = [];
 let currentAfterVisibleItems: NormalizeResult[] = [];
+let monitorBaselines = new Map<string, MonitorBaseline>();
+let monitorLastSnapshotAt = new Map<string, number>();
+let monitorPendingEntriesByDirectory = new Map<string, MonitorSnapshotEntry[]>();
+let monitorDirectoryBookmarks = new Map<string, string>();
+let lastMonitorStatusMessage = "";
+let monitorStartTimerId = 0;
+let monitorSnapshotCheckTimerId = 0;
+let monitorStartGeneration = 0;
+const ENABLE_MONITOR_BG_UI_BLOCKER = false;
+const MONITOR_STATE_SAVE_DEBOUNCE_MS = 1500;
+type MonitorPendingWorkerRequest = {
+  requestId: number;
+  retainedPendingEntries: MonitorSnapshotEntry[];
+  candidateEntries: MonitorSnapshotEntry[];
+  changedPaths: string[];
+  isIncrementalRefresh: boolean;
+};
+
+type MonitorPendingWorkerResponse = {
+  requestId: number;
+  pendingEntries: MonitorSnapshotEntry[];
+};
+
+let monitorPendingWorker: Worker | null = null;
+let monitorPendingWorkerRequestId = 0;
+const monitorPendingWorkerResolvers = new Map<
+  number,
+  { resolve: (entries: MonitorSnapshotEntry[]) => void; reject: (reason?: unknown) => void }
+>();
+let monitorBackgroundTaskCount = 0;
+let monitorBackgroundError = false;
+let monitorBackgroundErrorMessage = "";
+let monitorAutoSnapshotRunning = false;
+let monitorWatchListenersReady = false;
+let monitorWatchEventUnsubscribe: (() => void) | null = null;
+let monitorWatchErrorUnsubscribe: (() => void) | null = null;
+let mainWindowVisibilityUnsubscribe: (() => void) | null = null;
+const monitorWatchDebounceTimerIds = new Map<string, number>();
+const monitorWatchPendingPathsByRoot = new Map<string, Set<string>>();
+const monitorWatchRefreshRunningRoots = new Set<string>();
+let pretendardLoaded = false;
+let monitorStateSaveTimerId = 0;
+let monitorStateSaveInFlight = false;
+let monitorStateSaveQueued = false;
+let trayBackgroundConvertedCount = 0;
 let beforeVirtualLoadingTimerId = 0;
 let afterVirtualLoadingTimerId = 0;
-const THEME_STORAGE_KEY = "file-path-renamer-theme";
 const systemThemeMediaQuery = window.matchMedia("(prefers-color-scheme: dark)");
+
+function ensureMonitorPendingWorker() {
+  if (monitorPendingWorker) {
+    return monitorPendingWorker;
+  }
+
+  try {
+    monitorPendingWorker = new Worker(
+      new URL("./workers/monitorPending.worker.ts", import.meta.url),
+      { type: "module" }
+    );
+  } catch {
+    monitorPendingWorker = null;
+    return null;
+  }
+
+  monitorPendingWorker.onmessage = (event: MessageEvent<MonitorPendingWorkerResponse>) => {
+    const payload = event.data;
+    const resolver = monitorPendingWorkerResolvers.get(payload.requestId);
+    if (!resolver) {
+      return;
+    }
+    monitorPendingWorkerResolvers.delete(payload.requestId);
+    resolver.resolve(payload.pendingEntries);
+  };
+
+  monitorPendingWorker.onerror = (event) => {
+    const error = event.error ?? new Error(event.message || "monitor pending worker failed");
+    for (const [, resolver] of monitorPendingWorkerResolvers) {
+      resolver.reject(error);
+    }
+    monitorPendingWorkerResolvers.clear();
+    if (monitorPendingWorker) {
+      monitorPendingWorker.terminate();
+      monitorPendingWorker = null;
+    }
+  };
+
+  return monitorPendingWorker;
+}
+
+function terminateMonitorPendingWorker() {
+  if (monitorPendingWorker) {
+    monitorPendingWorker.terminate();
+    monitorPendingWorker = null;
+  }
+  for (const [, resolver] of monitorPendingWorkerResolvers) {
+    resolver.reject(new Error("monitor pending worker terminated"));
+  }
+  monitorPendingWorkerResolvers.clear();
+}
+
+async function calculatePendingEntries(
+  retainedPendingEntries: MonitorSnapshotEntry[],
+  candidateEntries: MonitorSnapshotEntry[],
+  changedPaths: string[],
+  isIncrementalRefresh: boolean
+) {
+  const worker = ensureMonitorPendingWorker();
+  if (!worker) {
+    const changedPathSet = new Set(changedPaths);
+    const inspectedPendingEntries = candidateEntries.filter((entry) =>
+      changedPathSet.has(entry.path)
+    );
+    const merged = isIncrementalRefresh
+      ? [...retainedPendingEntries, ...inspectedPendingEntries]
+      : inspectedPendingEntries;
+    return collapseMonitorPendingEntries(merged);
+  }
+
+  const requestId = ++monitorPendingWorkerRequestId;
+  const payload: MonitorPendingWorkerRequest = {
+    requestId,
+    retainedPendingEntries,
+    candidateEntries,
+    changedPaths,
+    isIncrementalRefresh
+  };
+
+  return await new Promise<MonitorSnapshotEntry[]>((resolve, reject) => {
+    monitorPendingWorkerResolvers.set(requestId, { resolve, reject });
+    try {
+      worker.postMessage(payload);
+    } catch (error) {
+      monitorPendingWorkerResolvers.delete(requestId);
+      reject(error);
+    }
+  });
+}
+
+function isRelevantMonitorWatchKind(kind: string) {
+  return kind === "create" || kind === "modify" || kind === "remove";
+}
+
+function getMonitorWatchDebounceDelay(kind: string) {
+  if (kind === "create" || kind === "remove") {
+    return 120;
+  }
+  return MONITOR_WATCH_DEBOUNCE_MS;
+}
+
+function persistAutoMonitorConvertEnabled(enabled: boolean) {
+  window.localStorage.setItem(AUTO_MONITOR_CONVERT_STORAGE_KEY, enabled ? "true" : "false");
+}
+
+function loadAutoMonitorConvertEnabled() {
+  return window.localStorage.getItem(AUTO_MONITOR_CONVERT_STORAGE_KEY) === "true";
+}
+
+function persistAutoConvertFilesEnabled(enabled: boolean) {
+  window.localStorage.setItem(AUTO_CONVERT_FILES_STORAGE_KEY, enabled ? "true" : "false");
+}
+
+function loadAutoConvertFilesEnabled() {
+  return window.localStorage.getItem(AUTO_CONVERT_FILES_STORAGE_KEY) === "true";
+}
+
+function syncAutoConvertFilesUI() {
+  if (state.autoMonitorConvertEnabled) {
+    autoConvertFilesLabel.classList.remove("opacity-40");
+    autoConvertFilesToggle.disabled = state.busy;
+  } else {
+    autoConvertFilesLabel.classList.add("opacity-40");
+    autoConvertFilesToggle.disabled = true;
+  }
+}
 
 function isThemePinnedByUser() {
   const stored = window.localStorage.getItem(THEME_STORAGE_KEY);
@@ -403,18 +758,7 @@ function applyTheme(darkMode: boolean, save = false) {
   const label = darkMode ? "라이트 모드로 전환" : "다크 모드로 전환";
   themeToggleButton.setAttribute("aria-label", label);
   themeToggleButton.title = label;
-  themeToggleButton.innerHTML = darkMode
-    ? `
-      <svg viewBox="0 0 20 20" aria-hidden="true" class="h-4 w-4 fill-current">
-        <path d="M12.5 2.8c.2 0 .3.2.2.3a7 7 0 1 0 4.2 10.8c.1-.2.4-.2.5 0 .1.1.1.3 0 .4a8 8 0 1 1-5.2-11.5h.3Z" />
-      </svg>
-    `
-    : `
-      <svg viewBox="0 0 20 20" aria-hidden="true" class="h-4 w-4 fill-none stroke-current stroke-[1.8]">
-        <circle cx="10" cy="10" r="3.5" />
-        <path d="M10 2.5v2M10 15.5v2M2.5 10h2M15.5 10h2M4.7 4.7l1.4 1.4M13.9 13.9l1.4 1.4M15.3 4.7l-1.4 1.4M6.1 13.9l-1.4 1.4" stroke-linecap="round" />
-      </svg>
-    `;
+  themeToggleButton.innerHTML = darkMode ? ICON_THEME_MOON : ICON_THEME_SUN;
   themeToggleButton.setAttribute("aria-pressed", darkMode ? "true" : "false");
   if (save) {
     window.localStorage.setItem(THEME_STORAGE_KEY, darkMode ? "dark" : "light");
@@ -446,7 +790,113 @@ function setupSystemThemeWatcher() {
     systemThemeMediaQuery.addEventListener("change", handleSystemThemeChange);
     return;
   }
-  systemThemeMediaQuery.addListener(handleSystemThemeChange);
+  (systemThemeMediaQuery as any).addListener(handleSystemThemeChange);
+}
+
+async function initializeLaunchAtLoginSetting() {
+  try {
+    state.launchAtLoginEnabled = await window.desktopBridge.isLaunchAtLoginEnabled();
+  } catch (error) {
+    state.launchAtLoginEnabled = false;
+    appendStatusLog(
+      `로그인시 자동 실행 설정을 읽지 못했습니다. 원인: ${getErrorMessage(error, "설정 읽기 실패")}`,
+      "error"
+    );
+  }
+  launchAtLoginToggle.checked = state.launchAtLoginEnabled;
+}
+
+function initializeAutoMonitorConvertSetting() {
+  state.autoMonitorConvertEnabled = loadAutoMonitorConvertEnabled();
+  autoMonitorConvertToggle.checked = state.autoMonitorConvertEnabled;
+  
+  state.autoConvertFilesEnabled = loadAutoConvertFilesEnabled();
+  autoConvertFilesToggle.checked = state.autoConvertFilesEnabled;
+  
+  syncAutoConvertFilesUI();
+}
+
+function syncAutomationSettingControls() {
+  launchAtLoginToggle.disabled = state.busy;
+  autoMonitorConvertToggle.disabled = state.busy;
+  syncAutoConvertFilesUI();
+}
+
+function clearMonitorPendingEntriesByPaths(paths: string[]) {
+  if (monitorPendingEntriesByDirectory.size === 0 || paths.length === 0) {
+    return;
+  }
+
+  const normalizedPaths = Array.from(new Set(paths.map((path) => normalizePathForCompare(path))));
+  let changed = false;
+  for (const [rootPath, entries] of monitorPendingEntriesByDirectory.entries()) {
+    const nextEntries = entries.filter((entry) => {
+      const entryPath = normalizePathForCompare(entry.path);
+      return !normalizedPaths.some(
+        (pendingPath) => entryPath === pendingPath || isPathInFolderTree(entryPath, pendingPath)
+      );
+    });
+    if (nextEntries.length !== entries.length) {
+      monitorPendingEntriesByDirectory.set(rootPath, nextEntries);
+      changed = true;
+    }
+  }
+
+  if (changed) {
+    recomputeMonitorPendingState();
+    updateMonitorLabels();
+    schedulePersistMonitorState();
+  }
+}
+
+async function scheduleAutoMonitorConvertIfNeeded() {
+  if (
+    !state.autoMonitorConvertEnabled ||
+    state.monitorPendingPaths.size === 0 ||
+    state.busy ||
+    state.monitorAutoConvertRunning
+  ) {
+    return;
+  }
+
+  state.monitorAutoConvertRunning = true;
+  updateAutoConvertForegroundOverlay();
+  try {
+    const pendingEntries = getUniquePendingEntries();
+    if (pendingEntries.length === 0) {
+      return;
+    }
+
+    // 자동 감지 + 자동 변환은 앱이 백그라운드일 때만 수행한다.
+    if (state.autoMonitorConvertEnabled && state.autoConvertFilesEnabled && !state.mainWindowVisible) {
+      appendStatusLog(
+        `자동 감지: ${pendingEntries.length}개 항목 변환을 시도합니다.`,
+        "idle"
+      );
+      await convertSourcePaths(
+        pendingEntries.map((entry) => entry.path),
+        true
+      );
+    }
+  } finally {
+    state.monitorAutoConvertRunning = false;
+    updateAutoConvertForegroundOverlay();
+  }
+}
+
+function getUniquePendingEntries() {
+  const pendingEntries: MonitorSnapshotEntry[] = [];
+  const seenPendingPaths = new Set<string>();
+  for (const entries of monitorPendingEntriesByDirectory.values()) {
+    for (const entry of entries) {
+      if (seenPendingPaths.has(entry.path)) {
+        continue;
+      }
+      seenPendingPaths.add(entry.path);
+      pendingEntries.push(entry);
+    }
+  }
+  return pendingEntries;
 }
 
 function showCopyToast(title: string, names: string[]) {
@@ -454,19 +904,65 @@ function showCopyToast(title: string, names: string[]) {
     window.clearTimeout(copyToastTimerId);
     copyToastTimerId = 0;
   }
+  copyToast.classList.remove("toast-success", "toast-error");
   copyToastTitle.textContent = title;
+  copyToastTitle.className = "text-[12px] font-semibold";
   const previewNames = names
     .slice(0, 10)
     .map((name) => `<p class="truncate">• ${escapeHtml(name)}</p>`)
     .join("");
   const remain = names.length - Math.min(names.length, 10);
-  const tail = remain > 0 ? `<p class="mt-0.5 text-stone-500">외 ${remain}개</p>` : "";
+  const tail = remain > 0 ? `<p class="mt-0.5 toast-tail">외 ${remain}개</p>` : "";
   copyToastList.innerHTML = `${previewNames}${tail}`;
   copyToast.classList.remove("hidden");
   copyToastTimerId = window.setTimeout(() => {
     copyToast.classList.add("hidden");
     copyToastTimerId = 0;
   }, 3400);
+}
+
+function showTaskToast(message: string, tone: Exclude<StatusTone, "idle">) {
+  const now = Date.now();
+  if (lastTaskToastMessage === message && now - lastTaskToastAt < 1200) {
+    return;
+  }
+  lastTaskToastMessage = message;
+  lastTaskToastAt = now;
+
+  if (copyToastTimerId !== 0) {
+    window.clearTimeout(copyToastTimerId);
+    copyToastTimerId = 0;
+  }
+
+  copyToast.classList.remove("toast-success", "toast-error");
+  copyToast.classList.add(tone === "error" ? "toast-error" : "toast-success");
+  copyToastTitle.textContent = tone === "error" ? "작업 실패" : "작업 완료";
+  copyToastTitle.className = "text-[12px] font-semibold";
+  copyToastList.innerHTML = `<p class="leading-4">${escapeHtml(message)}</p>`;
+  copyToast.classList.remove("hidden");
+  copyToastTimerId = window.setTimeout(() => {
+    copyToast.classList.add("hidden");
+    copyToastTimerId = 0;
+  }, 3200);
+}
+
+function loadPretendardStylesheet() {
+  if (pretendardLoaded) {
+    return;
+  }
+  pretendardLoaded = true;
+  const link = document.createElement("link");
+  link.rel = "stylesheet";
+  link.href = pretendardStylesheetUrl;
+  document.head.appendChild(link);
+}
+
+function updateTrayBackgroundBadge(count: number) {
+  const normalized = Math.max(0, Math.floor(count));
+  trayBackgroundConvertedCount = normalized;
+  void window.desktopBridge.setTrayBadgeCount(normalized).catch(() => {
+    // 트레이 배지 갱신 실패는 앱 동작에 영향을 주지 않도록 무시한다.
+  });
 }
 
 function hideAfterContextMenu() {
@@ -511,7 +1007,7 @@ function showBeforeContextMenu(x: number, y: number) {
   beforeContextConvertButton.disabled = !hasBeforeFiles || !hasConvertible || state.busy;
 }
 
-function appendStatusLog(message: string, tone: "idle" | "error" | "success" = "idle") {
+function appendStatusLog(message: string, tone: StatusTone = "idle") {
   const time = new Date();
   const stamp = `${String(time.getHours()).padStart(2, "0")}:${String(time.getMinutes()).padStart(2, "0")}:${String(
     time.getSeconds()
@@ -529,6 +1025,38 @@ function appendStatusLog(message: string, tone: "idle" | "error" | "success" = "
     statusLog.removeChild(statusLog.firstElementChild as Node);
   }
   statusLog.scrollTop = statusLog.scrollHeight;
+  if (tone === "success" || tone === "error") {
+    showTaskToast(message, tone);
+  }
+}
+
+function beginMonitorBackgroundTask() {
+  monitorBackgroundTaskCount += 1;
+  monitorBackgroundError = false;
+  monitorBackgroundErrorMessage = "";
+  updateMonitorProgressDisplay();
+  updateMonitorLabels();
+
+  if (ENABLE_MONITOR_BG_UI_BLOCKER && monitorBackgroundTaskCount === 1) {
+    setAppLoadingOverlay(true, state.monitorProgressMessage || "백그라운드 작업 중...");
+  }
+}
+
+function endMonitorBackgroundTask(success = true, errorMessage = "") {
+  monitorBackgroundTaskCount = Math.max(0, monitorBackgroundTaskCount - 1);
+  if (!success) {
+    monitorBackgroundError = true;
+    monitorBackgroundErrorMessage = errorMessage.trim() || monitorBackgroundErrorMessage;
+  } else if (monitorBackgroundTaskCount === 0) {
+    monitorBackgroundError = false;
+    monitorBackgroundErrorMessage = "";
+  }
+  if (ENABLE_MONITOR_BG_UI_BLOCKER && monitorBackgroundTaskCount === 0) {
+    state.monitorProgressMessage = "";
+    setAppLoadingOverlay(false);
+  }
+  updateMonitorProgressDisplay();
+  updateMonitorLabels();
 }
 
 const pathTooltip = document.createElement("div");
@@ -608,15 +1136,82 @@ function setBusy(nextBusy: boolean) {
   beforeList.querySelectorAll<HTMLButtonElement>(".before-remove-button").forEach((button) => {
     button.disabled = nextBusy;
   });
-  centerConvertButton.disabled = nextBusy || !hasBeforeConvertibleFiles();
   centerRefreshButton.disabled = nextBusy || (state.beforeItems.length === 0 && state.results.length === 0);
+  syncAutomationSettingControls();
+  updateMonitorProgressDisplay();
+  updateMonitorLabels();
+  updateAutoConvertForegroundOverlay();
+  if (!nextBusy) {
+    resetBeforeDropInteractionState();
+    void scheduleAutoMonitorConvertIfNeeded();
+  }
 }
 
-function setStatus(message: string, tone: "idle" | "error" | "success" = "idle") {
+function setStatus(message: string, tone: StatusTone = "idle") {
   statusText.textContent = message;
   statusText.classList.remove("status-idle", "status-error", "status-success");
   statusText.classList.add(`status-${tone}`);
   appendStatusLog(message, tone);
+}
+
+function updateMonitorProgressDisplay() {
+  // 상단 상태 로그 아래 별도 진행 라벨 영역을 제거함.
+  // 기존 호출부 호환을 위해 no-op 으로 유지한다.
+}
+
+function setMonitorProgressMessage(message: string) {
+  if (!ENABLE_MONITOR_BG_UI_BLOCKER) {
+    return;
+  }
+  state.monitorProgressMessage = message;
+  updateMonitorProgressDisplay();
+}
+
+function setAppLoadingOverlay(
+  active: boolean,
+  message: string = "작업을 처리하고 있습니다...",
+  force = false
+) {
+  if (!ENABLE_MONITOR_BG_UI_BLOCKER && !force) {
+    appLoadingOverlay.classList.add("hidden");
+    appLoadingOverlay.classList.remove("flex");
+    appLoadingOverlay.setAttribute("aria-hidden", "true");
+    return;
+  }
+  if (active) {
+    appLoadingMessage.textContent = message;
+    appLoadingOverlay.classList.remove("hidden");
+    appLoadingOverlay.classList.add("flex");
+    appLoadingOverlay.setAttribute("aria-hidden", "false");
+  } else {
+    appLoadingOverlay.classList.add("hidden");
+    appLoadingOverlay.classList.remove("flex");
+    appLoadingOverlay.setAttribute("aria-hidden", "true");
+  }
+}
+
+function shouldShowAutoConvertForegroundOverlay() {
+  return (
+    state.mainWindowVisible &&
+    state.monitorAutoConvertRunning &&
+    state.busy &&
+    state.autoMonitorConvertEnabled &&
+    state.autoConvertFilesEnabled
+  );
+}
+
+function updateAutoConvertForegroundOverlay() {
+  if (shouldShowAutoConvertForegroundOverlay()) {
+    setAppLoadingOverlay(
+      true,
+      "백그라운드에서 감지된 파일을 정책에 의해 자동 변환 중입니다 ...",
+      true
+    );
+    return;
+  }
+  if (!ENABLE_MONITOR_BG_UI_BLOCKER) {
+    setAppLoadingOverlay(false, "", true);
+  }
 }
 
 function setProgress(processed: number, total: number) {
@@ -639,6 +1234,9 @@ function hideProgress() {
   progressLabel.textContent = "작업 대기 중...";
   progressPercent.textContent = "";
   progressBar.style.transform = "scaleX(0)";
+  state.progressBaseLabel = "처리 중";
+  state.progressDotStep = 0;
+  updateMonitorProgressDisplay();
 }
 
 function startIndeterminateProgress() {
@@ -696,55 +1294,332 @@ function waitNextPaint() {
   });
 }
 
-function toWindowsPreviewBefore(value: string, changed: boolean) {
-  if (!changed) {
-    return value.normalize("NFC");
+function withMonitorPermissionGuidance(message: string) {
+  return toMonitorPermissionGuidance(message, {
+    monitorDirectoryPaths: state.monitorDirectoryPaths,
+    monitorDirectoryBookmarks,
+    isDev: import.meta.env.DEV
+  });
+}
+
+function toBeforeUnselectedCardClass(isDirectory: boolean, isNfdLike: boolean) {
+  if (isDirectory) {
+    return "border-sky-300 bg-sky-50 text-stone-900";
   }
-  return value.normalize("NFD");
-  //return Array.from(value.normalize("NFD")).join(" ");
+  return isNfdLike
+    ? "nfd-card border-stone-200 bg-white"
+    : "nfc-card border-stone-200 bg-stone-100";
 }
 
-function toWindowsPreviewAfter(value: string) {
-  return value.normalize("NFC");
+function getFolderSelectedCardClass() {
+  return "border-2 border-violet-500 bg-violet-100 text-stone-900";
 }
 
-function toCompactPath(rawPath: string) {
-  const normalizedPath = rawPath.replace(/\\/g, "/");
-  const isAbsolute = normalizedPath.startsWith("/");
-  const segments = normalizedPath.split("/").filter((segment) => segment.length > 0);
-  const normalizedSegments = segments.map((segment) => segment.normalize("NFC"));
-  if (normalizedSegments.length <= 6) {
-    return `${isAbsolute ? "/" : ""}${normalizedSegments.join("/")}`;
+function getSelectedCardClass() {
+  return "border-2 border-violet-500 bg-violet-100 text-stone-900";
+}
+
+function getFolderChipClass(isSelected: boolean) {
+  return isSelected
+    ? "border-violet-300 bg-violet-200 text-violet-800"
+    : "border-sky-300 bg-sky-200 text-sky-800";
+}
+
+function getFolderMetaTextClass(isSelected: boolean) {
+  return isSelected ? "text-violet-700" : "text-sky-700";
+}
+
+async function persistMonitorState() {
+  const uniqueValues = Array.from(new Set(state.monitorDirectoryPaths.filter((value) => value.trim().length > 0)));
+  const entries: MonitorStateEntry[] = uniqueValues.map((path) => ({
+    path,
+    lastSnapshotAt: monitorLastSnapshotAt.get(path) ?? null,
+    snapshotEntries: Array.from(monitorBaselines.get(path)?.byPath.values() ?? []),
+    pendingEntries: monitorPendingEntriesByDirectory.get(path) ?? [],
+    bookmarkData: monitorDirectoryBookmarks.get(path) ?? null
+  }));
+  await window.desktopBridge.saveMonitorState(entries);
+}
+
+async function loadPersistedMonitorState() {
+  monitorLastSnapshotAt.clear();
+  monitorBaselines.clear();
+  monitorPendingEntriesByDirectory.clear();
+  monitorDirectoryBookmarks.clear();
+  const entries = await window.desktopBridge.loadMonitorState();
+  const nextPaths: string[] = [];
+  for (const entry of entries) {
+    if (!entry.path.trim()) {
+      continue;
+    }
+    nextPaths.push(entry.path);
+    if (entry.lastSnapshotAt) {
+      monitorLastSnapshotAt.set(entry.path, entry.lastSnapshotAt);
+    }
+    if (entry.snapshotEntries.length > 0) {
+      monitorBaselines.set(entry.path, buildMonitorBaseline(entry.snapshotEntries));
+    }
+    if (entry.pendingEntries.length > 0) {
+      monitorPendingEntriesByDirectory.set(entry.path, collapseMonitorPendingEntries(entry.pendingEntries));
+    } else {
+      monitorPendingEntriesByDirectory.set(entry.path, []);
+    }
+    if (entry.bookmarkData) {
+      monitorDirectoryBookmarks.set(entry.path, entry.bookmarkData);
+    }
   }
-  const head = normalizedSegments.slice(0, 2);
-  const tail = normalizedSegments.slice(-3);
-  return `${isAbsolute ? "/" : ""}${[...head, "...", ...tail].join("/")}`;
+  recomputeMonitorPendingState();
+  return nextPaths;
 }
 
-function getDirectoryPath(rawPath: string) {
-  const normalizedPath = rawPath.replace(/\\/g, "/");
-  const isAbsolute = normalizedPath.startsWith("/");
-  const segments = normalizedPath.split("/").filter((segment) => segment.length > 0);
-  if (segments.length <= 1) {
-    return isAbsolute ? "/" : segments[0] ?? "";
+async function persistMonitorStateSafely() {
+  try {
+    await persistMonitorState();
+  } catch (error) {
+    const message = getErrorMessage(error, "모니터링 상태 저장 중 오류가 발생했습니다.");
+    monitorBackgroundErrorMessage = message;
+    appendStatusLog(`모니터링 상태 저장에 실패했습니다. 원인: ${message}`, "error");
   }
-  const parent = segments.slice(0, -1).join("/");
-  return `${isAbsolute ? "/" : ""}${parent}`;
 }
 
-function escapeHtmlAttribute(value: string) {
-  return value
-    .replace(/&/g, "&amp;")
-    .replace(/"/g, "&quot;")
-    .replace(/</g, "&lt;")
-    .replace(/>/g, "&gt;");
+function schedulePersistMonitorState(delay = MONITOR_STATE_SAVE_DEBOUNCE_MS) {
+  if (monitorStateSaveTimerId !== 0) {
+    window.clearTimeout(monitorStateSaveTimerId);
+  }
+  monitorStateSaveTimerId = window.setTimeout(() => {
+    monitorStateSaveTimerId = 0;
+    void persistMonitorStateCoalesced();
+  }, Math.max(0, delay));
 }
 
-function escapeHtml(value: string) {
-  return value
-    .replace(/&/g, "&amp;")
-    .replace(/</g, "&lt;")
-    .replace(/>/g, "&gt;");
+function cancelPersistMonitorStateSchedule() {
+  if (monitorStateSaveTimerId !== 0) {
+    window.clearTimeout(monitorStateSaveTimerId);
+    monitorStateSaveTimerId = 0;
+  }
+}
+
+async function persistMonitorStateCoalesced() {
+  if (monitorStateSaveInFlight) {
+    monitorStateSaveQueued = true;
+    return;
+  }
+  monitorStateSaveInFlight = true;
+  try {
+    await yieldToEventLoop();
+    await persistMonitorStateSafely();
+  } finally {
+    monitorStateSaveInFlight = false;
+    if (monitorStateSaveQueued) {
+      monitorStateSaveQueued = false;
+      schedulePersistMonitorState(300);
+    }
+  }
+}
+
+function getMonitorDirectoryInfos(): MonitorDirectoryInfo[] {
+  return state.monitorDirectoryPaths.map((path) => {
+    const pendingEntries = monitorPendingEntriesByDirectory.get(path) ?? [];
+    return {
+      path,
+      lastSnapshotAt: monitorLastSnapshotAt.get(path) ?? null,
+      pendingFileCount: pendingEntries.filter((entry) => !entry.isDirectory).length,
+      pendingDirectoryCount: pendingEntries.filter((entry) => entry.isDirectory).length,
+      pendingCount: pendingEntries.length
+    };
+  });
+}
+
+function recomputeMonitorPendingState() {
+  const uniquePaths = new Set<string>();
+  let pendingFileCount = 0;
+  let pendingDirectoryCount = 0;
+
+  monitorPendingEntriesByDirectory.forEach((entries) => {
+    for (const entry of entries) {
+      if (uniquePaths.has(entry.path)) {
+        continue;
+      }
+      uniquePaths.add(entry.path);
+      if (entry.isDirectory) {
+        pendingDirectoryCount += 1;
+      } else {
+        pendingFileCount += 1;
+      }
+    }
+  });
+
+  state.monitorPendingPaths = uniquePaths;
+  state.monitorPendingFileCount = pendingFileCount;
+  state.monitorPendingDirectoryCount = pendingDirectoryCount;
+}
+
+function areSamePendingEntries(
+  currentEntries: MonitorSnapshotEntry[],
+  nextEntries: MonitorSnapshotEntry[]
+) {
+  if (currentEntries.length !== nextEntries.length) {
+    return false;
+  }
+  for (let index = 0; index < currentEntries.length; index += 1) {
+    const current = currentEntries[index];
+    const next = nextEntries[index];
+    if (!next) {
+      return false;
+    }
+    if (
+      current.path !== next.path ||
+      current.isDirectory !== next.isDirectory ||
+      current.id !== next.id
+    ) {
+      return false;
+    }
+  }
+  return true;
+}
+
+function hasCenterConvertAction() {
+  return hasBeforeConvertibleFiles();
+}
+
+function updateCenterConvertButtonState() {
+  centerConvertButton.disabled = state.busy || !hasCenterConvertAction();
+  centerConvertBadge.textContent = "";
+  centerConvertBadge.classList.add("hidden");
+  centerConvertButton.classList.add("border-stone-300", "bg-white", "text-stone-600");
+  centerConvertButton.classList.remove("border-violet-400", "bg-violet-50", "text-violet-700");
+  centerConvertButton.title = "변환";
+  centerConvertButton.setAttribute("aria-label", "before 변환 실행");
+}
+
+function getMonitorActivityState(): "busy" | "error" | "idle" {
+  if (monitorBackgroundError) {
+    return "error";
+  }
+  if (monitorBackgroundTaskCount > 0) {
+    return "busy";
+  }
+  return "idle";
+}
+
+function updateMonitorLabels() {
+  const monitorInfos = getMonitorDirectoryInfos();
+  monitorDirectoryLabel.textContent =
+    state.monitorDirectoryPaths.length > 0
+      ? `모니터링 디렉토리 ${state.monitorDirectoryPaths.length}개`
+      : "모니터링 디렉토리를 선택해 주세요.";
+
+  let monitorStatusMessage = "";
+  if (state.monitorDirectoryPaths.length === 0) {
+    monitorStatusMessage = "모니터링 디렉토리를 추가하면 기준 스냅샷을 백그라운드에서 자동으로 준비합니다.";
+  } else if (state.monitorPendingPaths.size > 0) {
+    monitorStatusMessage = `감지 항목: 마지막 스냅샷 이후 변경/생성된 NFD 경로 파일 ${state.monitorPendingFileCount}개, 폴더 ${state.monitorPendingDirectoryCount}개. 변환 대상 찾기 버튼을 누르면 원본 파일 목록에 추가합니다.`;
+  } else if (monitorInfos.some((info) => info.lastSnapshotAt !== null)) {
+    monitorStatusMessage = "기준 스냅샷이 준비되었습니다. 이후 변경되거나 새로 생성된 NFD 경로 항목을 감지합니다.";
+  } else {
+    monitorStatusMessage = "기준 스냅샷이 없으면 백그라운드에서 자동으로 생성됩니다.";
+  }
+  if (monitorStatusMessage && monitorStatusMessage !== lastMonitorStatusMessage) {
+    appendStatusLog(monitorStatusMessage, "idle");
+    lastMonitorStatusMessage = monitorStatusMessage;
+  }
+
+  const previousValue = monitorDirectoryList.value;
+  if (monitorInfos.length === 0) {
+    monitorDirectoryList.innerHTML = `<option value="">등록된 모니터링 디렉토리가 없습니다.</option>`;
+    monitorDirectoryList.value = "";
+  } else {
+    monitorDirectoryList.innerHTML = monitorInfos
+      .map((info) => {
+        const pendingText =
+          info.pendingCount > 0 ? ` / NFD 감지 ${info.pendingFileCount}파일 ${info.pendingDirectoryCount}폴더` : "";
+        const snapshotText = info.lastSnapshotAt ? `마지막 스냅샷 ${formatSnapshotTime(info.lastSnapshotAt)}` : "마지막 스냅샷 없음";
+        return `<option value="${escapeHtmlAttribute(info.path)}">${escapeHtml(
+          `${toCompactPath(info.path)} | ${snapshotText}${pendingText}`
+        )}</option>`;
+      })
+      .join("");
+    monitorDirectoryList.value = monitorInfos.some((info) => info.path === previousValue)
+      ? previousValue
+      : monitorInfos[0]?.path ?? "";
+  }
+
+  monitorDirectoryClearButton.disabled = state.busy || state.monitorDirectoryPaths.length === 0;
+  monitorDirectoryPickButton.disabled = state.busy;
+  monitorDirectoryList.disabled = state.busy || state.monitorDirectoryPaths.length === 0;
+  
+  const pendingBadgeCount = Math.max(0, state.monitorPendingPaths.size);
+  monitorApplyButton.disabled = state.busy || state.monitorDirectoryPaths.length === 0;
+  monitorApplyButton.setAttribute("aria-label", "변환 대상 찾기");
+  monitorApplyButton.title = "변환 대상 찾기";
+  monitorApplyLabel.textContent = "변환 대상 찾기";
+  monitorApplyBadge.textContent = pendingBadgeCount > 99 ? "99+" : String(pendingBadgeCount);
+  monitorApplyBadge.classList.toggle("hidden", pendingBadgeCount === 0);
+  monitorActivityIndicator.classList.remove(
+    "border-stone-400/70",
+    "border-emerald-700/70",
+    "border-red-700/70",
+    "bg-stone-300",
+    "bg-emerald-500",
+    "bg-red-500",
+    "monitor-activity-blink"
+  );
+  const monitorActivityState = getMonitorActivityState();
+  if (monitorActivityState === "busy") {
+    monitorActivityIndicator.classList.add("border-emerald-700/70", "bg-emerald-500", "monitor-activity-blink");
+    monitorActivityIndicator.setAttribute("aria-label", "모니터링 백그라운드 작업 진행 중");
+    monitorActivityIndicator.title = "모니터링 백그라운드 작업 진행 중";
+    monitorActivityCount.textContent = `${monitorBackgroundTaskCount}개 작업중`;
+  } else if (monitorActivityState === "error") {
+    monitorActivityIndicator.classList.add("border-red-700/70", "bg-red-500");
+    monitorActivityIndicator.setAttribute("aria-label", "모니터링 백그라운드 작업 오류");
+    monitorActivityIndicator.title = "모니터링 백그라운드 작업 오류";
+    monitorActivityCount.textContent = "오류";
+  } else {
+    monitorActivityIndicator.classList.add("border-stone-400/70", "bg-stone-300");
+    monitorActivityIndicator.setAttribute("aria-label", "모니터링 백그라운드 작업 없음");
+    monitorActivityIndicator.title = "모니터링 백그라운드 작업 없음";
+    monitorActivityCount.textContent = "대기중";
+  }
+  updateCenterConvertButtonState();
+}
+
+function toBeforeChipVariant(isDirectory: boolean, isNfdLike: boolean): BeforeItem["chipVariant"] {
+  if (isDirectory) {
+    return "folder";
+  }
+  return isNfdLike ? "apple" : "window";
+}
+
+function toBeforeMetaLabel(item: Pick<BeforeItem, "isDirectory" | "folderFileCount" | "compactPath">) {
+  if (item.isDirectory) {
+    return `폴더(${item.folderFileCount}개): ${item.compactPath}`;
+  }
+  return item.compactPath;
+}
+
+function decorateBeforeItem(
+  item: RawBeforeItem
+): BeforeItem {
+  const nextItem: BeforeItem = {
+    ...item,
+    tooltipPath: escapeHtmlAttribute(item.sourcePath.normalize("NFC")),
+    metaLabel: "",
+    unselectedCardClass: toBeforeUnselectedCardClass(item.isDirectory, item.isNfdLike),
+    chipVariant: toBeforeChipVariant(item.isDirectory, item.isNfdLike)
+  };
+  nextItem.metaLabel = toBeforeMetaLabel(nextItem);
+  return nextItem;
+}
+
+function decorateNormalizeResult(
+  item: RawNormalizeResult,
+  convertedInBackground = false
+): NormalizeResult {
+  return {
+    ...item,
+    convertedInBackground
+  };
 }
 
 function appendAfterItems(items: NormalizeResult[]) {
@@ -755,7 +1630,6 @@ function appendAfterItems(items: NormalizeResult[]) {
       const previous = state.results[bySourceIndex];
       if (previous.outputPath !== item.outputPath) {
         resultIndexByOutputPath.delete(previous.outputPath);
-        afterRenderMetaCache.delete(previous.outputPath);
       }
       state.results[bySourceIndex] = item;
       resultIndexByOutputPath.set(item.outputPath, bySourceIndex);
@@ -774,106 +1648,36 @@ function appendAfterItems(items: NormalizeResult[]) {
   return changed;
 }
 
-function consumePendingNormalizeItems() {
-  if (pendingNormalizeItems.length === 0) {
-    return false;
-  }
-  const items = pendingNormalizeItems.splice(0, pendingNormalizeItems.length);
-  return appendAfterItems(items);
-}
-
-function scheduleNormalizeListFlush() {
-  if (normalizeFlushRafId !== 0) {
-    return;
-  }
-  normalizeFlushRafId = window.requestAnimationFrame(() => {
-    normalizeFlushRafId = 0;
-    const changed = consumePendingNormalizeItems();
-    if (!changed) {
-      return;
-    }
-    renderLists();
-    window.requestAnimationFrame(() => {
-      updateScrollFadeState(afterList);
-    });
-  });
-}
-
-function enqueueNormalizeItem(item: NormalizeResult) {
-  pendingNormalizeItems.push(item);
-  scheduleNormalizeListFlush();
-}
-
 function scheduleInspectOverlay(fileCount: number) {
   latestInspectFileCount = fileCount;
-  if (inspectOverlayRafId !== 0) {
-    return;
-  }
-  inspectOverlayRafId = window.requestAnimationFrame(() => {
-    inspectOverlayRafId = 0;
-    setBeforeListLoadingOverlay(true, `파일 목록 추가중... (파일 ${latestInspectFileCount}개)`);
-  });
-}
-
-function flushPendingInspectItems(existingPaths: Set<string>, addedPaths?: Set<string>) {
-  if (pendingInspectItems.length === 0) {
-    return false;
-  }
-
-  const incomingItems = pendingInspectItems.splice(0, pendingInspectItems.length);
-  let changed = false;
-
-  for (const item of incomingItems) {
-    if (existingPaths.has(item.sourcePath)) {
-      continue;
-    }
-    existingPaths.add(item.sourcePath);
-    addedPaths?.add(item.sourcePath);
-    state.beforeItems.push(item);
-    beforeRenderMetaCache.delete(item.sourcePath);
-    changed = true;
-  }
-
-  if (changed) {
-    recalculateFolderFileCounts();
-    renderLists();
-  }
-  return changed;
-}
-
-function scheduleInspectItemFlush(existingPaths: Set<string>, addedPaths?: Set<string>) {
-  if (inspectFlushTimerId !== 0) {
-    return;
-  }
-  inspectFlushTimerId = window.setTimeout(() => {
-    inspectFlushTimerId = 0;
-    const changed = flushPendingInspectItems(existingPaths, addedPaths);
-    if (!changed) {
-      return;
-    }
-    window.requestAnimationFrame(() => {
-      updateScrollFadeState(beforeList);
-    });
-  }, 12);
+  setBeforeListLoadingOverlay(true, `파일 목록 추가중... (파일 ${latestInspectFileCount}개)`);
 }
 
 function updateSelectionCount() {
   const total = state.results.length;
   const count = state.selectedOutputPaths.size;
   const allSelected = total > 0 && count === total;
-  selectAllAfterButton.textContent = allSelected ? "선택해제" : "전체선택";
+  const selectAllLabel = allSelected ? "선택 해제" : "전체 선택";
+  selectAllAfterButton.setAttribute("aria-label", selectAllLabel);
+  selectAllAfterButton.title = selectAllLabel;
+  selectAllAfterLabel.textContent = selectAllLabel;
   selectAllAfterButton.disabled = total === 0;
   copySelectionButton.disabled = count === 0;
   copyPathsButton.disabled = count === 0;
 }
 
 function updateListCounts() {
-  beforeCount.textContent = `(${getBeforeVisibleFileCount()}개)`;
+  if (state.beforeNfdOnly) {
+    const visibleCount = state.beforeItems.filter((item) => item.isNfdLike).length;
+    beforeCount.textContent = `(${visibleCount}/${state.beforeItems.length}개)`;
+  } else {
+    beforeCount.textContent = `(${state.beforeItems.length}개)`;
+  }
   afterCount.textContent = `(${state.results.length}개)`;
 }
 
 function getBeforeFileCount() {
-  return state.beforeItems.filter((item) => !item.isDirectory).length;
+  return state.beforeItems.length;
 }
 
 function hasBeforeConvertibleFiles() {
@@ -888,29 +1692,33 @@ function getSelectedBeforeConvertibleItems() {
   return getSelectedBeforeItems().filter((item) => item.changed);
 }
 
+function getSelectedAfterDragPaths() {
+  const selectedItems = state.results.filter((item) => state.selectedOutputPaths.has(item.outputPath));
+  const selectedDirectoryPaths = selectedItems
+    .filter((item) => item.isDirectory)
+    .map((item) => item.outputPath);
+
+  return selectedItems
+    .filter((item) => {
+      for (const directoryPath of selectedDirectoryPaths) {
+        if (directoryPath === item.outputPath) {
+          continue;
+        }
+        if (isPathInFolderTree(item.outputPath, directoryPath)) {
+          return false;
+        }
+      }
+      return true;
+    })
+    .map((item) => item.outputPath);
+}
+
 function getSelectedBeforeFileCount() {
   return getSelectedBeforeItems().length;
 }
 
 function getSelectedBeforeConvertibleCount() {
   return getSelectedBeforeConvertibleItems().length;
-}
-
-function getBeforeVisibleFileCount() {
-  if (!state.beforeNfdOnly) {
-    return getBeforeFileCount();
-  }
-  return state.beforeItems.filter((item) => !item.isDirectory && item.sourceNormalization === "NFD").length;
-}
-
-function normalizePathForCompare(value: string) {
-  return value.replace(/\\/g, "/");
-}
-
-function isPathInFolderTree(targetPath: string, folderPath: string) {
-  const normalizedTarget = normalizePathForCompare(targetPath);
-  const normalizedFolder = normalizePathForCompare(folderPath);
-  return normalizedTarget === normalizedFolder || normalizedTarget.startsWith(`${normalizedFolder}/`);
 }
 
 function recalculateFolderFileCounts() {
@@ -935,35 +1743,11 @@ function recalculateFolderFileCounts() {
       currentParent = parent.parentFolderPath;
     }
   }
-}
-
-function getBeforeRenderMeta(item: BeforeItem, isNfd: boolean) {
-  const cacheKey = item.sourcePath;
-  const cached = beforeRenderMetaCache.get(cacheKey);
-  if (cached) {
-    return cached;
+  for (const item of state.beforeItems) {
+    if (item.isDirectory) {
+      item.metaLabel = toBeforeMetaLabel(item);
+    }
   }
-  const meta = {
-    displayName: toWindowsPreviewBefore(item.sourceName, isNfd),
-    compactPath: toCompactPath(getDirectoryPath(item.sourcePath)),
-    title: escapeHtmlAttribute(item.sourcePath.normalize("NFC"))
-  };
-  beforeRenderMetaCache.set(cacheKey, meta);
-  return meta;
-}
-
-function getAfterRenderMeta(item: NormalizeResult) {
-  const cacheKey = item.outputPath;
-  const cached = afterRenderMetaCache.get(cacheKey);
-  if (cached) {
-    return cached;
-  }
-  const meta = {
-    displayName: toWindowsPreviewAfter(item.outputName),
-    compactPath: toCompactPath(getDirectoryPath(item.outputPath))
-  };
-  afterRenderMetaCache.set(cacheKey, meta);
-  return meta;
 }
 
 function getVirtualRange(scrollTop: number, itemCount: number) {
@@ -977,121 +1761,136 @@ function getVirtualRange(scrollTop: number, itemCount: number) {
 function renderBeforeCard(entry: { item: BeforeItem; originalIndex: number }, displayIndex: number) {
   const { item, originalIndex } = entry;
   const isSelected = state.selectedBeforePaths.has(item.sourcePath);
-  const selectedCardClass = isSelected ? "border-sky-300 bg-sky-50 text-stone-900 shadow-md shadow-sky-100" : "";
+  const selectedCardClass = isSelected ? getSelectedCardClass() : "";
   if (item.isDirectory) {
-    const folderPathDisplay = toCompactPath(getDirectoryPath(item.sourcePath));
-    const folderPathTitle = escapeHtmlAttribute(item.sourcePath.normalize("NFC"));
-    const folderCardClass = isSelected ? selectedCardClass : "border-rose-200/80 bg-rose-100/70";
+    const folderCardClass = isSelected ? getFolderSelectedCardClass() : item.unselectedCardClass;
+    const folderChipClass = getFolderChipClass(isSelected);
+    const folderMetaTextClass = getFolderMetaTextClass(isSelected);
     return `
-      <article class="before-card flex min-h-10 items-center gap-2 overflow-hidden rounded-xl border px-2.5 py-1.5 ${folderCardClass}" data-source-path="${item.sourcePath}" data-unselected-class="border-rose-200/80 bg-rose-100/70" data-path-tooltip="${folderPathTitle}">
-        <span class="inline-flex min-w-7 shrink-0 items-center justify-center rounded-md border border-stone-200 bg-white px-1.5 py-0.5 text-[11px] font-semibold text-stone-500">
+      <article class="before-card flex h-[42px] items-center gap-2 overflow-hidden rounded-xl border px-2.5 py-0 ${folderCardClass}" data-source-path="${item.sourcePath}" data-unselected-class="${item.unselectedCardClass}" data-path-tooltip="${item.tooltipPath}">
+        <span class="inline-flex min-w-6 shrink-0 items-center justify-center rounded-md border border-stone-200 bg-white px-1.5 py-0.5 text-[10px] font-semibold text-stone-500">
           ${displayIndex + 1}
         </span>
-        <span class="inline-flex h-6 w-6 shrink-0 items-center justify-center rounded-full border border-rose-300 bg-rose-200 text-rose-800">
-          <svg viewBox="0 0 20 20" aria-hidden="true" class="h-3.5 w-3.5 fill-current">
-            <path d="M2.5 5.5a2 2 0 0 1 2-2h3.2a1.4 1.4 0 0 1 1.1.5l.8 1h5.9a2 2 0 0 1 2 2v.6H2.5v-2.1Zm0 3.6h15v5.4a2 2 0 0 1-2 2h-11a2 2 0 0 1-2-2V9.1Z" />
-          </svg>
+        <span class="inline-flex h-5 w-5 shrink-0 items-center justify-center rounded-full border ${folderChipClass}">
+          ${ICON_FOLDER_CHIP}
         </span>
         <div class="min-w-0 flex-1">
-          <p class="max-w-full overflow-hidden text-ellipsis whitespace-nowrap text-sm font-medium text-stone-800">${item.sourceName.normalize("NFC")}</p>
-          <p class="truncate text-[11px] text-stone-400" data-path-tooltip="${folderPathTitle}">폴더(${item.folderFileCount}개): ${folderPathDisplay}</p>
+          <p class="h-4 max-w-full overflow-hidden text-ellipsis whitespace-nowrap text-[12px] font-medium leading-4 text-stone-800">${item.displayName}</p>
+          <p class="h-4 truncate text-[10px] leading-4 ${folderMetaTextClass}" data-path-tooltip="${item.tooltipPath}">${item.metaLabel}</p>
         </div>
         <button
-          class="before-remove-button ml-auto inline-flex h-5 w-5 shrink-0 items-center justify-center bg-transparent text-stone-500 transition hover:text-stone-800 disabled:cursor-not-allowed disabled:opacity-40"
+          class="before-remove-button ml-auto inline-flex h-4.5 w-4.5 shrink-0 items-center justify-center bg-transparent text-stone-500 transition hover:text-stone-800 disabled:cursor-not-allowed disabled:opacity-40"
           data-before-index="${originalIndex}"
           type="button"
           aria-label="before 항목 삭제"
           title="삭제"
           ${state.busy ? "disabled" : ""}
         >
-          <svg viewBox="0 0 20 20" aria-hidden="true" class="h-3.5 w-3.5 fill-none stroke-current stroke-[2]">
-            <path d="M5.5 5.5 14.5 14.5" stroke-linecap="round" />
-            <path d="M14.5 5.5 5.5 14.5" stroke-linecap="round" />
-          </svg>
+          ${ICON_REMOVE}
         </button>
       </article>
     `;
   }
 
-  const isNfd = item.sourceNormalization === "NFD" || item.sourceNormalization === "MIXED";
-  const sourceMeta = getBeforeRenderMeta(item, isNfd);
-  const beforeCardClass = isNfd ? "border-stone-200 bg-white" : "border-stone-200 bg-stone-50";
-  const inChipClass = isNfd ? "bg-violet-100 text-violet-700" : "bg-stone-200 text-stone-500";
-  const inChipIcon = isNfd
+  const inChipClass = "bg-stone-200 text-stone-500";
+  const inChipIcon = item.chipVariant === "apple"
     ? `
-      <svg viewBox="0 0 20 20" aria-hidden="true" class="h-3.5 w-3.5 fill-current">
-        <path d="M12.8 9.8c0-1.7.9-2.8 2.2-3.5-.8-1.2-2.1-1.8-3.4-1.9-1.4-.1-2.4.7-3 .7-.7 0-1.6-.7-2.7-.6-2.2.1-4.2 1.8-4.2 4.9 0 1.2.2 2.5.8 3.8.8 1.7 2 3.5 3.6 3.4.9 0 1.5-.6 2.5-.6 1.1 0 1.6.6 2.6.6 1.5 0 2.6-1.7 3.3-3.3.4-.8.6-1.4.7-1.7-2-.8-2.4-2.7-2.4-3.8Z"/>
-        <path d="M11.7 3.1c.5-.6.9-1.5.8-2.3-.8.1-1.8.6-2.3 1.2-.5.6-.9 1.4-.8 2.2.9.1 1.8-.4 2.3-1.1Z"/>
-      </svg>
+      ${ICON_NFD_CHIP}
     `
     : `
-      <svg viewBox="0 0 20 20" aria-hidden="true" class="h-3.5 w-3.5 fill-current">
-        <path d="M2 3.2 9.2 2v7H2V3.2Zm8.8-1.5L18 0.8v8.1h-7.2V1.7ZM2 10.1h7.2V17L2 15.8v-5.7Zm8.8 0H18v8.1l-7.2-1.1v-7Z"/>
-      </svg>
+      ${ICON_NFC_CHIP}
     `;
   return `
-    <article class="before-card flex min-h-10 items-center gap-2 overflow-hidden rounded-xl border px-2.5 py-1.5 ${isSelected ? selectedCardClass : beforeCardClass}" data-source-path="${item.sourcePath}" data-unselected-class="${beforeCardClass}" data-path-tooltip="${sourceMeta.title}">
-      <span class="inline-flex min-w-7 shrink-0 items-center justify-center rounded-md border border-stone-200 bg-white px-1.5 py-0.5 text-[11px] font-semibold text-stone-500">
+    <article class="before-card flex h-[42px] items-center gap-2 overflow-hidden rounded-xl border px-2.5 py-0 ${isSelected ? selectedCardClass : item.unselectedCardClass}" data-source-path="${item.sourcePath}" data-unselected-class="${item.unselectedCardClass}" data-path-tooltip="${item.tooltipPath}">
+      <span class="inline-flex min-w-6 shrink-0 items-center justify-center rounded-md border border-stone-200 bg-white px-1.5 py-0.5 text-[10px] font-semibold text-stone-500">
         ${displayIndex + 1}
       </span>
-      <span class="inline-flex h-6 w-6 shrink-0 items-center justify-center rounded-full ${inChipClass}">
+      <span class="inline-flex h-5 w-5 shrink-0 items-center justify-center rounded-full ${inChipClass}">
         ${inChipIcon}
       </span>
       <div class="min-w-0 flex-1">
-        <p class="max-w-full overflow-hidden text-ellipsis whitespace-nowrap text-sm font-medium text-stone-800">${sourceMeta.displayName}</p>
-        <p class="truncate text-[11px] text-stone-400" data-path-tooltip="${sourceMeta.title}">${sourceMeta.compactPath}</p>
+        <p class="h-4 max-w-full overflow-hidden text-ellipsis whitespace-nowrap text-[12px] font-medium leading-4 text-stone-800">
+          ${item.displayName}${
+            item.isNfdLike
+              ? `<span class="ml-1 text-[10px] font-medium text-stone-400">(${escapeHtml(item.normalizedDisplayName)})</span>`
+              : ""
+          }
+        </p>
+        <p class="h-4 truncate text-[10px] leading-4 text-stone-400" data-path-tooltip="${item.tooltipPath}">${item.metaLabel}</p>
       </div>
       <button
-        class="before-remove-button ml-auto inline-flex h-5 w-5 shrink-0 items-center justify-center bg-transparent text-stone-500 transition hover:text-stone-800 disabled:cursor-not-allowed disabled:opacity-40"
+        class="before-remove-button ml-auto inline-flex h-4.5 w-4.5 shrink-0 items-center justify-center bg-transparent text-stone-500 transition hover:text-stone-800 disabled:cursor-not-allowed disabled:opacity-40"
         data-before-index="${originalIndex}"
         type="button"
         aria-label="before 항목 삭제"
         title="삭제"
         ${state.busy ? "disabled" : ""}
       >
-        <svg viewBox="0 0 20 20" aria-hidden="true" class="h-3.5 w-3.5 fill-none stroke-current stroke-[2]">
-          <path d="M5.5 5.5 14.5 14.5" stroke-linecap="round" />
-          <path d="M14.5 5.5 5.5 14.5" stroke-linecap="round" />
-        </svg>
+        ${ICON_REMOVE}
       </button>
     </article>
   `;
 }
 
 function renderAfterCard(item: NormalizeResult, index: number) {
-  const outputMeta = getAfterRenderMeta(item);
   const isSelected = state.selectedOutputPaths.has(item.outputPath);
-  const stateClasses = isSelected
-    ? "border-sky-300 bg-sky-50 text-stone-900 shadow-md shadow-sky-100"
-    : "border-stone-200 bg-stone-50";
-  const metaTextClass = isSelected ? "text-sky-700" : "text-stone-400";
+  const fileUnselectedClass = toBeforeUnselectedCardClass(false, item.changed);
+  const stateClasses = item.isDirectory
+    ? isSelected
+      ? getFolderSelectedCardClass()
+      : toBeforeUnselectedCardClass(true, false)
+    : isSelected
+      ? getSelectedCardClass()
+      : fileUnselectedClass;
+  const metaTextClass = item.isDirectory
+    ? getFolderMetaTextClass(isSelected)
+    : "text-stone-400";
+  const chipClass = item.isDirectory
+    ? getFolderChipClass(isSelected)
+    : "bg-stone-200 text-stone-500";
+  const icon = item.isDirectory
+    ? `
+      ${ICON_FOLDER_CHIP}
+    `
+    : `
+      ${ICON_NFC_CHIP}
+    `;
+  const convertSourceBadgeClass = item.convertedInBackground
+    ? "after-convert-source-bg"
+    : "after-convert-source-manual";
+  const convertSourceBadgeLabel = item.convertedInBackground ? "백그라운드 자동 변환" : "수동";
 
   return `
     <article
-      class="after-card flex min-h-10 w-full cursor-pointer items-center gap-2 overflow-hidden rounded-xl border px-2.5 py-1.5 transition ${stateClasses}"
+      class="after-card flex h-[42px] w-full cursor-pointer items-center gap-2 overflow-hidden rounded-xl border px-2.5 py-0 transition ${stateClasses}"
       data-output-path="${item.outputPath}"
-      data-unselected-class="border-stone-200 bg-stone-50"
+      data-unselected-class="${item.isDirectory ? toBeforeUnselectedCardClass(true, false) : fileUnselectedClass}"
     >
-      <span class="inline-flex min-w-7 shrink-0 items-center justify-center rounded-md border border-stone-200 bg-white px-1.5 py-0.5 text-[11px] font-semibold text-stone-500">
+      <span class="inline-flex min-w-6 shrink-0 items-center justify-center rounded-md border border-stone-200 bg-white px-1.5 py-0.5 text-[10px] font-semibold text-stone-500">
         ${index + 1}
       </span>
-      <span class="inline-flex h-6 w-6 shrink-0 items-center justify-center rounded-full bg-stone-200 text-stone-500">
-        <svg viewBox="0 0 20 20" aria-hidden="true" class="h-3.5 w-3.5 fill-current">
-          <path d="M2 3.2 9.2 2v7H2V3.2Zm8.8-1.5L18 0.8v8.1h-7.2V1.7ZM2 10.1h7.2V17L2 15.8v-5.7Zm8.8 0H18v8.1l-7.2-1.1v-7Z"/>
-        </svg>
+      <span class="inline-flex h-5 w-5 shrink-0 items-center justify-center rounded-full ${chipClass}">
+        ${icon}
       </span>
       <div class="min-w-0 flex-1">
-        <p class="max-w-full truncate text-sm font-medium text-stone-800">${outputMeta.displayName}</p>
-        <p class="truncate text-[11px] ${metaTextClass}" data-after-meta="true">${outputMeta.compactPath}</p>
+        <p class="h-4 max-w-full truncate text-[12px] font-medium leading-4 text-stone-800">${item.displayName}</p>
+        <p class="h-4 truncate text-[10px] leading-4 ${metaTextClass}" data-after-meta="true">${item.compactPath}</p>
       </div>
+      <span class="ml-2 inline-flex h-5 shrink-0 items-center rounded-full border px-1.5 text-[10px] font-semibold leading-none ${convertSourceBadgeClass}">
+        ${convertSourceBadgeLabel}
+      </span>
     </article>
   `;
 }
 
 function renderVirtualBeforeList(entries: Array<{ item: BeforeItem; originalIndex: number }>) {
-  const scrollTop = beforeList.scrollTop;
-  const { startIndex, endIndex } = getVirtualRange(scrollTop, entries.length);
   const totalHeight = entries.length * VIRTUAL_ROW_HEIGHT;
+  const maxScrollTop = Math.max(0, totalHeight - beforeList.clientHeight);
+  const scrollTop = Math.min(beforeList.scrollTop, maxScrollTop);
+  if (scrollTop !== beforeList.scrollTop) {
+    beforeList.scrollTop = scrollTop;
+  }
+  const { startIndex, endIndex } = getVirtualRange(scrollTop, entries.length);
   const visibleHtml = entries
     .slice(startIndex, endIndex)
     .map((entry, offset) => {
@@ -1107,9 +1906,13 @@ function renderVirtualBeforeList(entries: Array<{ item: BeforeItem; originalInde
 }
 
 function renderVirtualAfterList(items: NormalizeResult[]) {
-  const scrollTop = afterList.scrollTop;
-  const { startIndex, endIndex } = getVirtualRange(scrollTop, items.length);
   const totalHeight = items.length * VIRTUAL_ROW_HEIGHT;
+  const maxScrollTop = Math.max(0, totalHeight - afterList.clientHeight);
+  const scrollTop = Math.min(afterList.scrollTop, maxScrollTop);
+  if (scrollTop !== afterList.scrollTop) {
+    afterList.scrollTop = scrollTop;
+  }
+  const { startIndex, endIndex } = getVirtualRange(scrollTop, items.length);
   const visibleHtml = items
     .slice(startIndex, endIndex)
     .map((item, offset) => {
@@ -1221,7 +2024,7 @@ function refreshBeforeSelectionVisuals() {
     }
     applyCardSelectionClass(card, state.selectedBeforePaths.has(sourcePath));
   });
-  centerConvertButton.disabled = state.busy || !hasBeforeConvertibleFiles();
+  updateCenterConvertButtonState();
 }
 
 function refreshAfterSelectionVisuals() {
@@ -1230,8 +2033,8 @@ function refreshAfterSelectionVisuals() {
     applyCardSelectionClass(card, selected);
     const meta = card.querySelector<HTMLElement>("[data-after-meta=\"true\"]");
     if (meta) {
-      meta.classList.toggle("text-sky-700", selected);
-      meta.classList.toggle("text-stone-500", !selected);
+      meta.classList.toggle("text-violet-700", selected);
+      meta.classList.toggle("text-stone-400", !selected);
     }
   });
   updateSelectionCount();
@@ -1247,8 +2050,8 @@ function refreshAfterSelectionByPaths(paths: Iterable<string>) {
     applyCardSelectionClass(card, selected);
     const meta = card.querySelector<HTMLElement>("[data-after-meta=\"true\"]");
     if (meta) {
-      meta.classList.toggle("text-sky-700", selected);
-      meta.classList.toggle("text-stone-500", !selected);
+      meta.classList.toggle("text-violet-700", selected);
+      meta.classList.toggle("text-stone-400", !selected);
     }
   }
   updateSelectionCount();
@@ -1267,6 +2070,8 @@ function renderEmptyList(target: HTMLDivElement, message: string, showPickerButt
         data-before-picker="true"
         class="inline-flex items-center whitespace-nowrap rounded-md bg-stone-900 px-3 py-1.5 text-[11px] font-semibold text-white transition hover:bg-stone-800 disabled:cursor-not-allowed disabled:bg-stone-400"
         type="button"
+        aria-label="파일 추가"
+        title="파일 추가"
       >
         파일 추가
       </button>
@@ -1284,6 +2089,7 @@ function setBeforeListLoadingOverlay(active: boolean, message = "파일 목록 �
     if (current) {
       current.remove();
     }
+    beforeList.classList.remove("pointer-events-none");
     return;
   }
 
@@ -1298,46 +2104,56 @@ function setBeforeListLoadingOverlay(active: boolean, message = "파일 목록 �
   const overlay = document.createElement("div");
   overlay.id = overlayId;
   overlay.className =
-    "absolute inset-0 z-40 flex items-center justify-center rounded-2xl bg-stone-900/20 backdrop-blur-[1px] pointer-events-none";
+    "absolute inset-0 z-40 flex cursor-progress items-center justify-center rounded-2xl bg-stone-900/40 backdrop-blur-[1px]";
   overlay.innerHTML = `
-    <div class="flex items-center gap-2 rounded-xl border border-stone-200 bg-white/95 px-4 py-2 shadow-sm">
-      <svg viewBox="0 0 20 20" aria-hidden="true" class="h-4 w-4 animate-spin text-sky-600 fill-none stroke-current stroke-[2]">
-        <circle cx="10" cy="10" r="7" class="opacity-25" />
-        <path d="M10 3a7 7 0 0 1 7 7" stroke-linecap="round" class="opacity-100" />
-      </svg>
-      <p data-loading-text class="text-xs font-semibold text-stone-700">${message}</p>
+    <div class="inline-flex items-center gap-2 rounded-full border border-stone-200 bg-white px-4 py-2 text-[12px] font-semibold text-stone-700 shadow-sm">
+      <span class="h-3.5 w-3.5 animate-spin rounded-full border-2 border-sky-200 border-t-sky-500"></span>
+      <span data-loading-text>${message}</span>
     </div>
   `;
+  const blockOverlayEvent = (event: Event) => {
+    event.preventDefault();
+    event.stopPropagation();
+  };
+  overlay.addEventListener("click", blockOverlayEvent);
+  overlay.addEventListener("mousedown", blockOverlayEvent);
+  overlay.addEventListener("mouseup", blockOverlayEvent);
+  overlay.addEventListener("pointerdown", blockOverlayEvent);
+  overlay.addEventListener("pointerup", blockOverlayEvent);
+  overlay.addEventListener("wheel", blockOverlayEvent, { passive: false });
+  beforeList.classList.add("pointer-events-none");
   beforeListHost.appendChild(overlay);
 }
 
 function setBeforeDropActive(active: boolean) {
-  const dropPanel = beforeList.querySelector<HTMLElement>("[data-before-drop-panel]");
-  const overlayId = "before-list-drop-overlay";
-  const existingOverlay = beforeListHost.querySelector<HTMLDivElement>(`#${overlayId}`);
-  if (dropPanel) {
-    if (existingOverlay) {
-      existingOverlay.remove();
-    }
-    dropPanel.classList.toggle("before-drop-active", active);
-    beforeList.classList.remove("before-list-drop-active");
-    return;
-  }
-
+  const overlayId = "before-section-drop-overlay";
+  const existingOverlay = beforeSection.querySelector<HTMLDivElement>(`#${overlayId}`);
   beforeList.classList.toggle("before-list-drop-active", active);
   if (!active) {
     if (existingOverlay) {
       existingOverlay.remove();
     }
+    beforeSection.classList.remove("before-section-drop-active");
     return;
   }
 
   if (!existingOverlay) {
     const overlay = document.createElement("div");
     overlay.id = overlayId;
-    overlay.className = "before-list-drop-overlay";
-    beforeListHost.appendChild(overlay);
+    overlay.className = "before-section-drop-overlay";
+    const blockEvent = (event: Event) => {
+      event.preventDefault();
+      event.stopPropagation();
+    };
+    overlay.addEventListener("click", blockEvent);
+    overlay.addEventListener("mousedown", blockEvent);
+    overlay.addEventListener("mouseup", blockEvent);
+    overlay.addEventListener("pointerdown", blockEvent);
+    overlay.addEventListener("pointerup", blockEvent);
+    overlay.addEventListener("wheel", blockEvent, { passive: false });
+    beforeSection.appendChild(overlay);
   }
+  beforeSection.classList.add("before-section-drop-active");
 }
 
 function pingBeforeDropActive() {
@@ -1352,7 +2168,7 @@ function pingBeforeDropActive() {
 }
 
 function getBeforeDropZoneElement() {
-  return (beforeList.querySelector<HTMLElement>("[data-before-drop-panel]") ?? beforeList) as HTMLElement;
+  return beforeSection;
 }
 
 let beforeDropZoneBound: HTMLElement | null = null;
@@ -1433,6 +2249,41 @@ function bindBeforeDropZoneEvents() {
   beforeDropZoneBound.addEventListener("drop", handleBeforeDrop);
 }
 
+function resetBeforeDropInteractionState() {
+  state.beforeDragDepth = 0;
+  if (state.beforeDragHoverTimerId !== 0) {
+    window.clearTimeout(state.beforeDragHoverTimerId);
+    state.beforeDragHoverTimerId = 0;
+  }
+  setBeforeDropActive(false);
+  setBeforeListLoadingOverlay(false);
+  beforeList.classList.remove("pointer-events-none");
+}
+
+function yieldToEventLoop() {
+  return new Promise<void>((resolve) => setTimeout(resolve, 0));
+}
+
+let renderListsRafId = 0;
+
+function scheduleRenderLists() {
+  if (renderListsRafId !== 0) {
+    return;
+  }
+  renderListsRafId = window.requestAnimationFrame(() => {
+    renderListsRafId = 0;
+    renderLists();
+  });
+}
+
+function renderListsSync() {
+  if (renderListsRafId !== 0) {
+    window.cancelAnimationFrame(renderListsRafId);
+    renderListsRafId = 0;
+  }
+  renderLists();
+}
+
 function renderLists() {
   const existingBeforePaths = new Set(state.beforeItems.map((item) => item.sourcePath));
   state.selectedBeforePaths.forEach((sourcePath) => {
@@ -1443,11 +2294,15 @@ function renderLists() {
   updateListCounts();
   updateSelectionCount();
   beforeFilterToggleButton.setAttribute("aria-pressed", state.beforeNfdOnly ? "true" : "false");
+  const beforeFilterLabel = state.beforeNfdOnly ? "전체 보기" : "NFD만 보기";
+  beforeFilterToggleButton.setAttribute("aria-label", beforeFilterLabel);
+  beforeFilterToggleButton.title = beforeFilterLabel;
   beforeFilterTogglePill.classList.toggle("bg-sky-500", state.beforeNfdOnly);
   beforeFilterTogglePill.classList.toggle("bg-stone-300", !state.beforeNfdOnly);
   beforeFilterToggleKnob.classList.toggle("translate-x-5", state.beforeNfdOnly);
-  centerConvertButton.disabled = state.busy || !hasBeforeConvertibleFiles();
+  beforeFilterToggleText.textContent = "NFD만 보기";
   centerRefreshButton.disabled = state.busy || (state.beforeItems.length === 0 && state.results.length === 0);
+  updateMonitorLabels();
 
   const beforeVisibleEntries = state.beforeItems
     .map((item, originalIndex) => ({ item, originalIndex }))
@@ -1455,7 +2310,7 @@ function renderLists() {
       if (!state.beforeNfdOnly) {
         return true;
       }
-      return !item.isDirectory && item.sourceNormalization === "NFD";
+      return item.isNfdLike;
     });
 
   currentBeforeVisibleEntries = beforeVisibleEntries;
@@ -1511,12 +2366,7 @@ function renderLists() {
 
   updateScrollFades();
   bindBeforeDropZoneEvents();
-}
-
-function scrollListsToBottom() {
-  beforeList.scrollTop = beforeList.scrollHeight;
-  afterList.scrollTop = afterList.scrollHeight;
-  updateScrollFades();
+  resetBeforeDropInteractionState();
 }
 
 function updateScrollFadeState(list: HTMLDivElement) {
@@ -1542,57 +2392,536 @@ function updateScrollFades() {
   updateScrollFadeState(afterList);
 }
 
+async function scanMonitorDirectorySnapshot(rootPath: string) {
+  if (!rootPath) {
+    return [];
+  }
+  return window.desktopBridge.scanMonitorDirectory(rootPath);
+}
+
+async function scanMonitorChangedPaths(changedPaths: string[]) {
+  const collapsedPaths = collapseMonitorChangedPaths(changedPaths);
+  if (collapsedPaths.length === 0) {
+    return [];
+  }
+  return window.desktopBridge.scanMonitorPaths(collapsedPaths);
+}
+
+async function refreshMonitorBaselineForPath(path: string, reason: string, notify = true) {
+  setMonitorProgressMessage(`스냅샷 생성 중: ${toCompactPath(path)}`);
+  setAppLoadingOverlay(true, `스냅샷 생성 중: ${toCompactPath(path)}`);
+  try {
+    const snapshot = await scanMonitorDirectorySnapshot(path);
+    monitorBaselines.set(path, buildMonitorBaseline(snapshot));
+    monitorLastSnapshotAt.set(path, Date.now());
+    monitorPendingEntriesByDirectory.set(path, []);
+    recomputeMonitorPendingState();
+    schedulePersistMonitorState();
+    updateMonitorLabels();
+    if (notify) {
+      appendStatusLog(`${reason}: ${toCompactPath(path)} 기준 ${snapshot.length}개 항목을 갱신했습니다.`, "success");
+    }
+  } finally {
+    setAppLoadingOverlay(false);
+  }
+}
+
+async function recalculateMonitorPendingForPath(
+  path: string,
+  advanceSnapshotOnClear: boolean,
+  changedPaths?: string[]
+) {
+  await yieldToEventLoop();
+  const message = advanceSnapshotOnClear
+    ? `스냅샷 재계산 중: ${toCompactPath(path)}`
+    : `변경 감지 확인 중: ${toCompactPath(path)}`;
+  setMonitorProgressMessage(message);
+  if (advanceSnapshotOnClear) {
+    setAppLoadingOverlay(true, message);
+  }
+  const pendingEntries = await window.desktopBridge.daemonCollectPendingEntries([path]);
+  monitorPendingEntriesByDirectory.set(path, collapseMonitorPendingEntries(pendingEntries));
+
+  if (!monitorBaselines.has(path)) {
+    const snapshot = await scanMonitorDirectorySnapshot(path);
+    monitorBaselines.set(path, buildMonitorBaseline(snapshot));
+    monitorLastSnapshotAt.set(path, Date.now());
+  }
+
+  await yieldToEventLoop();
+
+  recomputeMonitorPendingState();
+  schedulePersistMonitorState();
+  updateMonitorLabels();
+  void scheduleAutoMonitorConvertIfNeeded();
+
+  if (advanceSnapshotOnClear) {
+    setAppLoadingOverlay(false);
+  }
+}
+
+function clearMonitorWatchDebounceTimers() {
+  for (const timerId of monitorWatchDebounceTimerIds.values()) {
+    window.clearTimeout(timerId);
+  }
+  monitorWatchDebounceTimerIds.clear();
+  monitorWatchPendingPathsByRoot.clear();
+  monitorWatchRefreshRunningRoots.clear();
+}
+
+function stopMonitorPolling() {
+  if (monitorStartTimerId !== 0) {
+    window.clearTimeout(monitorStartTimerId);
+    monitorStartTimerId = 0;
+  }
+  if (monitorSnapshotCheckTimerId !== 0) {
+    window.clearTimeout(monitorSnapshotCheckTimerId);
+    monitorSnapshotCheckTimerId = 0;
+  }
+  clearMonitorWatchDebounceTimers();
+  void window.desktopBridge.stopMonitorWatch().catch((error) => {
+    appendStatusLog(
+      `모니터링 watcher 중지에 실패했습니다. 원인: ${getErrorMessage(
+        error,
+        "watcher 중지 실패"
+      )}`,
+      "error"
+    );
+  });
+}
+
+function getMonitorPathsNeedingAutoSnapshot(now = Date.now()) {
+  return state.monitorDirectoryPaths.filter((path) => {
+    const lastSnapshotAt = monitorLastSnapshotAt.get(path) ?? null;
+    return lastSnapshotAt === null || now - lastSnapshotAt >= MONITOR_SNAPSHOT_STALE_MS;
+  });
+}
+
+function scheduleMonitorSnapshotCheck(delay = MONITOR_SNAPSHOT_CHECK_INTERVAL_MS) {
+  if (monitorSnapshotCheckTimerId !== 0) {
+    window.clearTimeout(monitorSnapshotCheckTimerId);
+  }
+  if (state.monitorDirectoryPaths.length === 0) {
+    monitorSnapshotCheckTimerId = 0;
+    return;
+  }
+  monitorSnapshotCheckTimerId = window.setTimeout(() => {
+    monitorSnapshotCheckTimerId = 0;
+    void runAutoSnapshotRefresh(true);
+  }, delay);
+}
+
+async function runAutoSnapshotRefresh(showToast = true) {
+  if (monitorAutoSnapshotRunning || state.busy || state.monitorDirectoryPaths.length === 0) {
+    scheduleMonitorSnapshotCheck();
+    return;
+  }
+
+  const paths = getMonitorPathsNeedingAutoSnapshot();
+  if (paths.length === 0) {
+    scheduleMonitorSnapshotCheck();
+    return;
+  }
+
+  monitorAutoSnapshotRunning = true;
+  beginMonitorBackgroundTask();
+  let success = true;
+  let errorMessage = "";
+  try {
+    const compactTargets = paths.map((path) => toCompactPath(path));
+    if (showToast) {
+      showCopyToast(
+        paths.some((path) => (monitorLastSnapshotAt.get(path) ?? null) === null)
+          ? "기준 스냅샷을 자동 생성합니다"
+          : "기준 스냅샷을 자동 갱신합니다",
+        compactTargets
+      );
+    }
+    appendStatusLog(
+      paths.some((path) => (monitorLastSnapshotAt.get(path) ?? null) === null)
+        ? `기준 스냅샷 ${paths.length}개를 백그라운드에서 자동 생성합니다.`
+        : `12시간이 지나 기준 스냅샷 ${paths.length}개를 백그라운드에서 자동 갱신합니다.`,
+      "idle"
+    );
+    for (const path of paths) {
+      const hasSnapshot = (monitorLastSnapshotAt.get(path) ?? null) !== null;
+      await refreshMonitorBaselineForPath(
+        path,
+        hasSnapshot ? "기준 스냅샷 자동 갱신 완료" : "기준 스냅샷 자동 생성 완료",
+        false
+      );
+    }
+    appendStatusLog(`모니터링 기준 스냅샷 ${paths.length}개를 자동으로 반영했습니다.`, "success");
+    scheduleInitialMonitorPolling(false);
+  } catch (error) {
+    success = false;
+    errorMessage = withMonitorPermissionGuidance(getErrorMessage(error, "자동 스냅샷 갱신에 실패했습니다."));
+    appendStatusLog(`자동 스냅샷 갱신에 실패했습니다. 원인: ${errorMessage}`, "error");
+  } finally {
+    monitorAutoSnapshotRunning = false;
+    endMonitorBackgroundTask(success, errorMessage);
+    scheduleMonitorSnapshotCheck();
+  }
+}
+
+async function runMonitorWatchRefresh(path: string, changedPaths: string[]) {
+  if (!state.monitorDirectoryPaths.includes(path) || !monitorBaselines.has(path)) {
+    return;
+  }
+  if (monitorWatchRefreshRunningRoots.has(path)) {
+    scheduleMonitorWatchRefresh(path, changedPaths);
+    return;
+  }
+  if (state.busy) {
+    scheduleMonitorWatchRefresh(path, changedPaths);
+    return;
+  }
+  // scheduleAutoMonitorConvertIfNeeded 가 진행 중이면 pending 집합이 변경될 수 있으므로,
+  // 그 사이 추가 watch refresh 가 끼어들어 mid-flight 에 pending 을 재채우는 race 를 피한다.
+  if (state.monitorAutoConvertRunning) {
+    scheduleMonitorWatchRefresh(path, changedPaths);
+    return;
+  }
+
+  monitorWatchRefreshRunningRoots.add(path);
+  beginMonitorBackgroundTask();
+  let success = true;
+  let errorMessage = "";
+  try {
+    await recalculateMonitorPendingForPath(path, false, changedPaths);
+  } catch (error) {
+    success = false;
+    errorMessage = withMonitorPermissionGuidance(
+      getErrorMessage(error, "모니터링 폴더 확인 중 오류가 발생했습니다.")
+    );
+    appendStatusLog(errorMessage, "error");
+  } finally {
+    endMonitorBackgroundTask(success, errorMessage);
+    monitorWatchRefreshRunningRoots.delete(path);
+    if ((monitorWatchPendingPathsByRoot.get(path)?.size ?? 0) > 0) {
+      scheduleMonitorWatchRefresh(path);
+    }
+  }
+}
+
+function scheduleMonitorWatchRefresh(path: string, changedPaths: string[] = [path], kind = "modify") {
+  if (!path || !state.monitorDirectoryPaths.includes(path) || !monitorBaselines.has(path)) {
+    return;
+  }
+  const pendingPaths = monitorWatchPendingPathsByRoot.get(path) ?? new Set<string>();
+  for (const changedPath of changedPaths) {
+    if (changedPath === path || isPathInFolderTree(changedPath, path)) {
+      pendingPaths.add(changedPath);
+    }
+  }
+  if (pendingPaths.size === 0) {
+    pendingPaths.add(path);
+  }
+  monitorWatchPendingPathsByRoot.set(path, pendingPaths);
+  const existingTimerId = monitorWatchDebounceTimerIds.get(path);
+  if (existingTimerId) {
+    window.clearTimeout(existingTimerId);
+  }
+  const debounceDelay = getMonitorWatchDebounceDelay(kind);
+  const timerId = window.setTimeout(() => {
+    monitorWatchDebounceTimerIds.delete(path);
+    const queuedPaths = Array.from(monitorWatchPendingPathsByRoot.get(path) ?? [path]);
+    monitorWatchPendingPathsByRoot.delete(path);
+    void runMonitorWatchRefresh(path, queuedPaths);
+  }, debounceDelay);
+  monitorWatchDebounceTimerIds.set(path, timerId);
+}
+
+async function ensureMonitorWatchListeners() {
+  if (monitorWatchListenersReady) {
+    return;
+  }
+  monitorWatchEventUnsubscribe = await window.desktopBridge.onMonitorWatchEvent((event) => {
+    if (!isRelevantMonitorWatchKind(event.kind)) {
+      return;
+    }
+    // 감지 자체는 창 가시성과 무관하게 항상 동작해야 한다. 창이 떠 있을 때는 사용자가
+    // "감지 항목" 버튼으로 수동으로 당겨오고, 창이 숨겨졌을 때는
+    // scheduleAutoMonitorConvertIfNeeded() 가 (자체 visibility 가드로) 히스토리에 수집한다.
+    for (const root of event.roots) {
+      const changedPaths = event.paths.filter(
+        (candidatePath) => candidatePath === root || isPathInFolderTree(candidatePath, root)
+      );
+      scheduleMonitorWatchRefresh(root, changedPaths.length > 0 ? changedPaths : [root], event.kind);
+    }
+  });
+  monitorWatchErrorUnsubscribe = await window.desktopBridge.onMonitorWatchError((message) => {
+    monitorBackgroundError = true;
+    monitorBackgroundErrorMessage = message;
+    updateMonitorLabels();
+    appendStatusLog(`모니터링 watcher 오류: ${message}`, "error");
+  });
+  monitorWatchListenersReady = true;
+}
+
+async function startMonitorPolling(notify = true) {
+  beginMonitorBackgroundTask();
+  let success = true;
+  let errorMessage = "";
+  ++monitorStartGeneration;
+  stopMonitorPolling();
+  try {
+    if (
+      state.monitorDirectoryPaths.length === 0 ||
+      !state.autoMonitorConvertEnabled ||
+      state.mainWindowVisible
+    ) {
+      // 자동 감지가 꺼져 있거나 모니터링 경로가 없으면 Watcher 를 끕니다.
+      await window.desktopBridge.stopMonitorWatch();
+      
+      if (state.monitorDirectoryPaths.length === 0) {
+        monitorBaselines.clear();
+        monitorLastSnapshotAt.clear();
+        monitorPendingEntriesByDirectory.clear();
+        monitorDirectoryBookmarks.clear();
+      } else if (!state.autoMonitorConvertEnabled) {
+        // 자동 감지 끔 -> 기존 Pending 목록과 뱃지를 초기화 (수동 '대상 찾기' 모드로 전환)
+        monitorPendingEntriesByDirectory.clear();
+        state.monitorDirectoryPaths.forEach(p => monitorPendingEntriesByDirectory.set(p, []));
+      } else if (state.mainWindowVisible) {
+        // 포그라운드에서는 자동 감지를 일시 중지한다.
+        if (notify) {
+          appendStatusLog("앱이 포그라운드 상태여서 자동 감지를 일시 중지합니다.", "idle");
+        }
+      }
+      
+      recomputeMonitorPendingState();
+      updateMonitorLabels();
+      return;
+    }
+
+    const watchedPaths = state.monitorDirectoryPaths.filter((path) => monitorBaselines.has(path));
+    if (watchedPaths.length === 0) {
+      await window.desktopBridge.stopMonitorWatch();
+      recomputeMonitorPendingState();
+      updateMonitorLabels();
+      scheduleMonitorSnapshotCheck(Math.min(MONITOR_START_DELAY_MS, 1000));
+      return;
+    }
+
+    await ensureMonitorWatchListeners();
+
+    if (notify) {
+      appendStatusLog("저장된 기준 스냅샷을 기준으로 자동 모니터링 감지를 시작합니다.", "idle");
+    }
+    setMonitorProgressMessage("모니터링 감지 준비 중...");
+    await window.desktopBridge.startMonitorWatch(watchedPaths);
+
+    for (const path of watchedPaths) {
+      await recalculateMonitorPendingForPath(path, false);
+    }
+    void scheduleAutoMonitorConvertIfNeeded();
+    scheduleMonitorSnapshotCheck();
+  } catch (error) {
+    success = false;
+    const message = withMonitorPermissionGuidance(getErrorMessage(error, "모니터링 폴더 초기화에 실패했습니다."));
+    errorMessage = message;
+    const shouldResetDirectory =
+      message.includes("모니터링 폴더 확인 실패") ||
+      message.includes("모니터링 대상은 폴더여야 합니다.") ||
+      message.includes("No such file") ||
+      message.includes("not found");
+
+    if (shouldResetDirectory) {
+      const previousPaths = [...state.monitorDirectoryPaths];
+      state.monitorDirectoryPaths = [];
+      monitorBaselines.clear();
+      monitorLastSnapshotAt.clear();
+      monitorPendingEntriesByDirectory.clear();
+      monitorDirectoryBookmarks.clear();
+      recomputeMonitorPendingState();
+      schedulePersistMonitorState();
+      updateMonitorLabels();
+      appendStatusLog(
+        previousPaths.length > 0
+          ? `저장된 모니터링 디렉토리를 열 수 없어 모두 해제했습니다. 원인: ${message}`
+          : `모니터링 폴더 초기화에 실패했습니다. 원인: ${message}`,
+        "error"
+      );
+      return;
+    }
+
+    recomputeMonitorPendingState();
+    updateMonitorLabels();
+    appendStatusLog(`모니터링 폴더 초기화에 실패했습니다. 원인: ${message}`, "error");
+  } finally {
+    endMonitorBackgroundTask(success, errorMessage);
+  }
+}
+
+function startMonitorPollingInBackground(notify = true) {
+  void startMonitorPolling(notify);
+}
+
+function scheduleInitialMonitorPolling(notify = true) {
+  stopMonitorPolling();
+  updateMonitorLabels();
+  monitorStartTimerId = window.setTimeout(() => {
+    monitorStartTimerId = 0;
+    void startMonitorPolling(notify);
+  }, MONITOR_START_DELAY_MS);
+}
+
+async function chooseMonitorDirectory() {
+  if (state.busy) {
+    return;
+  }
+  const selected = await window.desktopBridge.pickMonitorDirectory();
+  if (!selected?.path) {
+    return;
+  }
+  if (state.monitorDirectoryPaths.includes(selected.path)) {
+    appendStatusLog("이미 모니터링 목록에 있는 디렉토리입니다.", "idle");
+    return;
+  }
+  state.monitorDirectoryPaths = [...state.monitorDirectoryPaths, selected.path];
+  if (selected.bookmarkData) {
+    monitorDirectoryBookmarks.set(selected.path, selected.bookmarkData);
+  }
+  monitorPendingEntriesByDirectory.set(selected.path, []);
+  await persistMonitorStateSafely();
+  updateMonitorLabels();
+  appendStatusLog(`${toCompactPath(selected.path)} 모니터링 디렉토리를 추가했습니다. 첫 기준 스냅샷을 생성합니다...`, "idle");
+  showCopyToast("모니터링 추가", [toCompactPath(selected.path)]);
+  
+  // 모니터링 폴더를 추가하면 즉시 스냅샷을 생성하여 대상 찾기나 자동 감지가 동작할 수 있는 기준을 만듭니다.
+  void refreshMonitorBaselineForPath(selected.path, "새 모니터링 디렉토리 등록", true);
+  
+  // 자동 감지가 켜져 있다면 Watcher를 켜기 위해 Initial Polling 스케줄링
+  if (state.autoMonitorConvertEnabled) {
+    scheduleInitialMonitorPolling(true);
+  }
+}
+
+function clearMonitorDirectory() {
+  if (state.busy) {
+    return;
+  }
+  stopMonitorPolling();
+  state.monitorDirectoryPaths = [];
+  monitorBaselines.clear();
+  monitorLastSnapshotAt.clear();
+  monitorPendingEntriesByDirectory.clear();
+  monitorDirectoryBookmarks.clear();
+  recomputeMonitorPendingState();
+  void persistMonitorStateSafely();
+  updateMonitorLabels();
+  appendStatusLog("모니터링 디렉토리를 모두 해제했습니다.", "idle");
+  showCopyToast("모니터링 해제", ["모든 모니터링 디렉토리"]);
+}
+
+async function removeMonitorDirectory(path: string) {
+  if (state.busy) {
+    return;
+  }
+  stopMonitorPolling();
+  state.monitorDirectoryPaths = state.monitorDirectoryPaths.filter((value) => value !== path);
+  monitorBaselines.delete(path);
+  monitorLastSnapshotAt.delete(path);
+  monitorPendingEntriesByDirectory.delete(path);
+  monitorDirectoryBookmarks.delete(path);
+  recomputeMonitorPendingState();
+  await persistMonitorStateSafely();
+  updateMonitorLabels();
+  appendStatusLog(`${toCompactPath(path)} 모니터링을 해제했습니다.`, "idle");
+  showCopyToast("모니터링 해제", [toCompactPath(path)]);
+  if (state.monitorDirectoryPaths.some((value) => monitorBaselines.has(value))) {
+    scheduleInitialMonitorPolling(false);
+  } else {
+    scheduleMonitorSnapshotCheck(500);
+  }
+}
+
+async function applyPendingMonitorChanges() {
+  if (state.monitorDirectoryPaths.length === 0) {
+    setStatus("검색할 모니터링 대상 디렉토리가 없습니다.", "error");
+    return;
+  }
+
+  const hasAnyBaseline = state.monitorDirectoryPaths.some((path) => monitorBaselines.has(path));
+  if (!hasAnyBaseline) {
+    setStatus("스냅샷 기준이 없습니다. 모니터링 디렉토리를 추가해 기준 스냅샷을 준비해 주세요.", "error");
+    return;
+  }
+
+  setBusy(true);
+  setBeforeListLoadingOverlay(true, "변환 대상을 찾는 중입니다...");
+  appendStatusLog("스냅샷 기준으로 변환 대상을 다시 검색합니다.", "idle");
+
+  try {
+    for (const path of state.monitorDirectoryPaths) {
+      if (!monitorBaselines.has(path)) {
+        continue;
+      }
+      await recalculateMonitorPendingForPath(path, false);
+    }
+
+    recomputeMonitorPendingState();
+    updateMonitorLabels();
+
+    const pendingPaths = Array.from(state.monitorPendingPaths);
+    if (pendingPaths.length > 0) {
+      appendStatusLog(`변환 대상 검색 완료: ${pendingPaths.length}개를 원본 파일 목록에 추가합니다.`, "success");
+      await enqueuePaths(pendingPaths);
+    } else {
+      appendStatusLog("변환 대상 검색 완료: 새로 추가할 항목이 없습니다.", "success");
+    }
+  } catch (error) {
+    const message = getErrorMessage(error, "변환 대상 검색 중 오류 발생");
+    appendStatusLog(message, "error");
+  } finally {
+    setMonitorProgressMessage("");
+    setBeforeListLoadingOverlay(false);
+    setBusy(false);
+  }
+}
+
 async function enqueuePaths(filePaths: string[]) {
   if (filePaths.length === 0) {
     setStatus("파일 경로를 읽지 못했습니다. Finder에서 실제 파일을 드롭해 주세요.", "error");
     return;
   }
 
-  const existing = new Set(state.beforeItems.map((item) => item.sourcePath));
   const addedDuringInspect = new Set<string>();
-  const uniquePaths = filePaths.filter((filePath) => !existing.has(filePath));
-  if (uniquePaths.length === 0) {
-    setStatus("이미 원본 파일 목록에 있는 파일입니다.", "idle");
-    return;
-  }
+  const excludePaths = [
+    ...state.beforeItems.map((item) => item.sourcePath),
+    ...state.results.map((item) => item.outputPath)
+  ];
 
   setBusy(true);
   setBeforeListLoadingOverlay(true, "파일 목록 추가중... (파일 0개)");
   setStatus("폴더/파일 목록을 분석 중입니다...");
   let unsubscribeInspect: (() => void) | null = null;
-  let unsubscribeInspectBatch: (() => void) | null = null;
 
   try {
-    unsubscribeInspectBatch = await window.desktopBridge.onInspectBatch((items) => {
-      pendingInspectItems.push(...items);
-      scheduleInspectItemFlush(existing, addedDuringInspect);
-    });
     unsubscribeInspect = await window.desktopBridge.onInspectProgress((progress) => {
       scheduleInspectOverlay(progress.fileCount);
     });
     await waitNextPaint();
-    const inspectedItems = await window.desktopBridge.inspectSourceFiles(uniquePaths);
-    if (inspectFlushTimerId !== 0) {
-      window.clearTimeout(inspectFlushTimerId);
-      inspectFlushTimerId = 0;
-    }
-    flushPendingInspectItems(existing, addedDuringInspect);
+    const collected = await window.desktopBridge.daemonCollectTargets(filePaths, excludePaths);
+    const inspectedItems = collected.items.map((item) => decorateBeforeItem(item));
+    const existing = new Set(state.beforeItems.map((item) => normalizePathForCompare(item.sourcePath)));
     for (const item of inspectedItems) {
-      if (existing.has(item.sourcePath)) {
+      const compareKey = normalizePathForCompare(item.sourcePath);
+      if (existing.has(compareKey)) {
         continue;
       }
-      existing.add(item.sourcePath);
+      existing.add(compareKey);
       addedDuringInspect.add(item.sourcePath);
       state.beforeItems.push(item);
-      beforeRenderMetaCache.delete(item.sourcePath);
     }
     const addedCount = addedDuringInspect.size;
     if (addedCount === 0) {
-      setStatus("이미 원본 파일 목록에 있는 항목입니다.", "idle");
+      setStatus("이미 원본/변환 목록에 있는 항목입니다.", "idle");
       return;
     }
     recalculateFolderFileCounts();
-    renderLists();
+    renderListsSync();
     window.requestAnimationFrame(() => {
       beforeList.scrollTop = beforeList.scrollHeight;
       updateScrollFadeState(beforeList);
@@ -1602,7 +2931,7 @@ async function enqueuePaths(filePaths: string[]) {
       (item) => addedDuringInspect.has(item.sourcePath) && item.isDirectory
     ).length;
     const addedFileCount = addedCount - addedFolderCount;
-    const skippedCount = inspectedItems.length - addedCount + (filePaths.length - uniquePaths.length);
+    const skippedCount = Math.max(0, collected.skippedExistingCount + (collected.requestedCount - collected.inspectedCount));
     if (skippedCount > 0) {
       setStatus(
         `원본 파일 목록에 파일 ${addedFileCount}개, 폴더 ${addedFolderCount}개 추가 (${skippedCount}개 중복 제외)`,
@@ -1615,18 +2944,6 @@ async function enqueuePaths(filePaths: string[]) {
     const message = error instanceof Error ? error.message : "파일 정보를 확인하는 중 오류가 발생했습니다.";
     setStatus(message, "error");
   } finally {
-    if (inspectFlushTimerId !== 0) {
-      window.clearTimeout(inspectFlushTimerId);
-      inspectFlushTimerId = 0;
-    }
-    pendingInspectItems.length = 0;
-    if (inspectOverlayRafId !== 0) {
-      window.cancelAnimationFrame(inspectOverlayRafId);
-      inspectOverlayRafId = 0;
-    }
-    if (unsubscribeInspectBatch) {
-      unsubscribeInspectBatch();
-    }
     if (unsubscribeInspect) {
       unsubscribeInspect();
     }
@@ -1635,104 +2952,160 @@ async function enqueuePaths(filePaths: string[]) {
   }
 }
 
-async function convertSourcePaths(sourcePaths: string[]) {
+async function convertSourcePaths(sourcePaths: string[], isBackgroundAutoConvert = false) {
   if (state.busy) {
     return;
   }
-  const uniqueSourcePaths = Array.from(new Set(sourcePaths));
+  const uniqueSourcePaths = Array.from(new Set(sourcePaths.map((value) => value.trim()).filter((value) => value.length > 0)));
   if (uniqueSourcePaths.length === 0) {
     setStatus("변환할 파일이 없습니다.", "error");
     return;
   }
-  let unsubscribe: (() => void) | null = null;
-  let unsubscribeItem: (() => void) | null = null;
+  let didRenderListInTry = false;
 
   try {
     setBusy(true);
     startProgressAnimation();
     setProgress(0, uniqueSourcePaths.length);
     setStatus(`${uniqueSourcePaths.length}개 항목을 변환 중입니다...`);
-
-    unsubscribe = await window.desktopBridge.onNormalizeProgress((progress) => {
-      setProgress(progress.processed, progress.total);
+    const CONVERT_BATCH_SIZE = 50;
+    const sortedSourcePaths = [...uniqueSourcePaths].sort((left, right) => {
+      const leftDepth = left.split("/").filter((part) => part.length > 0).length;
+      const rightDepth = right.split("/").filter((part) => part.length > 0).length;
+      return rightDepth - leftDepth;
     });
-    unsubscribeItem = await window.desktopBridge.onNormalizeItem((item) => {
-      enqueueNormalizeItem(item);
-    });
 
-    const finalResults = await window.desktopBridge.normalizeFileNames(uniqueSourcePaths);
-    if (normalizeFlushRafId !== 0) {
-      window.cancelAnimationFrame(normalizeFlushRafId);
-      normalizeFlushRafId = 0;
-    }
-    consumePendingNormalizeItems();
-    appendAfterItems(finalResults);
-    const convertedSourcePathSet = new Set(uniqueSourcePaths);
-    const convertedDirectoryPaths = new Set(
-      state.beforeItems
-        .filter((item) => item.isDirectory && convertedSourcePathSet.has(item.sourcePath))
-        .map((item) => item.sourcePath)
-    );
-    state.beforeItems = state.beforeItems.filter((item) => {
-      if (convertedSourcePathSet.has(item.sourcePath)) {
-        return false;
+    const requestedCount = sortedSourcePaths.length;
+    let uniqueCount = 0;
+    let processedCount = 0;
+    const finalResults: NormalizeResult[] = [];
+    const beforeListCountBefore = state.beforeItems.length;
+    const afterListCountBefore = state.results.length;
+
+    for (let offset = 0; offset < sortedSourcePaths.length; offset += CONVERT_BATCH_SIZE) {
+      const batchPaths = sortedSourcePaths.slice(offset, offset + CONVERT_BATCH_SIZE);
+      if (batchPaths.length === 0) {
+        continue;
       }
-      for (const directoryPath of convertedDirectoryPaths) {
-        if (isPathInFolderTree(item.sourcePath, directoryPath)) {
+
+      const converted = await window.desktopBridge.daemonConvertTargets(batchPaths);
+      const batchResults = converted.results.map((item) =>
+        decorateNormalizeResult(item, isBackgroundAutoConvert)
+      );
+      finalResults.push(...batchResults);
+      appendAfterItems(batchResults);
+
+      const batchConvertedSourcePathSet = new Set(batchResults.map((item) => item.sourcePath));
+      const batchConvertedDirectoryPaths = new Set(
+        state.beforeItems
+          .filter((item) => item.isDirectory && batchConvertedSourcePathSet.has(item.sourcePath))
+          .map((item) => item.sourcePath)
+      );
+
+      state.beforeItems = state.beforeItems.filter((item) => {
+        if (batchConvertedSourcePathSet.has(item.sourcePath)) {
           return false;
         }
-      }
-      return true;
-    });
-    recalculateFolderFileCounts();
-    beforeRenderMetaCache.clear();
-    state.selectedBeforePaths.forEach((sourcePath) => {
-      if (convertedSourcePathSet.has(sourcePath)) {
-        state.selectedBeforePaths.delete(sourcePath);
-        return;
-      }
-      for (const directoryPath of convertedDirectoryPaths) {
-        if (isPathInFolderTree(sourcePath, directoryPath)) {
+        for (const directoryPath of batchConvertedDirectoryPaths) {
+          if (isPathInFolderTree(item.sourcePath, directoryPath)) {
+            return false;
+          }
+        }
+        return true;
+      });
+
+      state.selectedBeforePaths.forEach((sourcePath) => {
+        if (batchConvertedSourcePathSet.has(sourcePath)) {
           state.selectedBeforePaths.delete(sourcePath);
           return;
         }
-      }
-    });
-    state.selectedOutputPaths.clear();
-    renderLists();
-    window.requestAnimationFrame(() => {
-      afterList.scrollTop = afterList.scrollHeight;
-      updateScrollFadeState(afterList);
-    });
+        for (const directoryPath of batchConvertedDirectoryPaths) {
+          if (isPathInFolderTree(sourcePath, directoryPath)) {
+            state.selectedBeforePaths.delete(sourcePath);
+            return;
+          }
+        }
+      });
 
-    setProgress(uniqueSourcePaths.length, uniqueSourcePaths.length);
+      clearConvertedMonitorPendingEntries(batchConvertedSourcePathSet, batchConvertedDirectoryPaths);
+
+      uniqueCount += converted.uniqueCount > 0 ? converted.uniqueCount : batchResults.length;
+      processedCount = Math.min(requestedCount, processedCount + (converted.uniqueCount > 0 ? converted.uniqueCount : batchPaths.length));
+      setProgress(processedCount, requestedCount);
+
+      recalculateFolderFileCounts();
+      state.selectedOutputPaths.clear();
+      renderListsSync();
+      didRenderListInTry = true;
+
+      window.requestAnimationFrame(() => {
+        afterList.scrollTop = afterList.scrollHeight;
+        updateScrollFadeState(afterList);
+      });
+
+      if (isBackgroundAutoConvert && batchResults.length > 0) {
+        updateTrayBackgroundBadge(trayBackgroundConvertedCount + batchResults.length);
+      }
+
+      void batchResults;
+    }
+
+    const completedTotal = uniqueCount > 0 ? uniqueCount : uniqueSourcePaths.length;
+    setProgress(completedTotal, completedTotal);
     const changedCount = finalResults.filter((item) => item.changed).length;
+    const beforeRemovedCount = beforeListCountBefore - state.beforeItems.length;
+    const afterAddedCount = state.results.length - afterListCountBefore;
+    const requestedSummary =
+      requestedCount !== uniqueCount
+        ? `${requestedCount}개 요청(${uniqueCount}개 중복 제외)`
+        : `${uniqueCount}개`;
     setStatus(
-      `${finalResults.length}개 출력 파일을 만들었습니다. ${changedCount}개는 NFD에서 NFC로 변경되었습니다.`,
+      `${requestedSummary} 기준으로 ${finalResults.length}개 결과를 처리했습니다. before ${beforeRemovedCount}개 제거, after ${afterAddedCount}개 추가. ${changedCount}개는 NFD에서 NFC로 변경되었습니다.`,
       "success"
     );
   } catch (error) {
     const message = error instanceof Error ? error.message : "알 수 없는 오류가 발생했습니다.";
     setStatus(message, "error");
   } finally {
-    if (normalizeFlushRafId !== 0) {
-      window.cancelAnimationFrame(normalizeFlushRafId);
-      normalizeFlushRafId = 0;
-    }
-    pendingNormalizeItems.length = 0;
-    if (unsubscribe) {
-      unsubscribe();
-    }
-    if (unsubscribeItem) {
-      unsubscribeItem();
-    }
-    window.setTimeout(() => {
-      if (!state.busy) {
-        hideProgress();
-      }
-    }, 250);
+    hideProgress();
     setBusy(false);
-    renderLists();
+    if (!didRenderListInTry) {
+      renderListsSync();
+    }
+  }
+}
+
+async function refreshMonitorStateAfterConversion(monitorPaths: string[]) {
+  beginMonitorBackgroundTask();
+  let success = true;
+  let errorMessage = "";
+  try {
+    for (const path of monitorPaths) {
+      if (!state.monitorDirectoryPaths.includes(path)) {
+        continue;
+      }
+      setMonitorProgressMessage(`변환 후 스냅샷 재계산 중: ${toCompactPath(path)}`);
+      await recalculateMonitorPendingForPath(path, false);
+      
+      // 변환이 완료된 후 해당 폴더의 pending 항목이 0개가 되었다면 스냅샷을 갱신합니다.
+      const pendingEntries = monitorPendingEntriesByDirectory.get(path) ?? [];
+      if (pendingEntries.length === 0) {
+        monitorLastSnapshotAt.set(path, Date.now());
+        schedulePersistMonitorState();
+        updateMonitorLabels();
+      }
+    }
+    if (state.monitorPendingPaths.size === 0) {
+      appendStatusLog("모니터링 감지 항목이 모두 NFC로 정리되어 스냅샷 시간을 갱신했습니다.", "success");
+    } else {
+      appendStatusLog("모니터링 감지 항목이 남아 있어 기존 스냅샷 시간을 유지합니다.", "idle");
+    }
+  } catch (error) {
+    success = false;
+    errorMessage = withMonitorPermissionGuidance(getErrorMessage(error, "모니터링 상태 재계산에 실패했습니다."));
+    appendStatusLog(`모니터링 상태 재계산에 실패했습니다. 원인: ${errorMessage}`, "error");
+  } finally {
+    endMonitorBackgroundTask(success, errorMessage);
   }
 }
 
@@ -1755,6 +3128,41 @@ async function convertAllBeforeConvertibleItems() {
   await convertSourcePaths(sourcePaths);
 }
 
+function clearConvertedMonitorPendingEntries(
+  convertedSourcePathSet: Set<string>,
+  convertedDirectoryPaths: Set<string>
+) {
+  if (monitorPendingEntriesByDirectory.size === 0) {
+    return;
+  }
+
+  let changed = false;
+  for (const [path, entries] of monitorPendingEntriesByDirectory.entries()) {
+    const nextEntries = entries.filter((entry) => {
+      if (convertedSourcePathSet.has(entry.path)) {
+        return false;
+      }
+      for (const directoryPath of convertedDirectoryPaths) {
+        if (isPathInFolderTree(entry.path, directoryPath)) {
+          return false;
+        }
+      }
+      return true;
+    });
+
+    if (nextEntries.length !== entries.length) {
+      monitorPendingEntriesByDirectory.set(path, nextEntries);
+      changed = true;
+    }
+  }
+
+  if (changed) {
+    recomputeMonitorPendingState();
+    updateMonitorLabels();
+    schedulePersistMonitorState();
+  }
+}
+
 function clearAllItems() {
   if (state.busy) {
     return;
@@ -1768,14 +3176,15 @@ function clearAllItems() {
 
   state.beforeItems = [];
   state.selectedBeforePaths.clear();
-  beforeRenderMetaCache.clear();
   state.results = [];
   resultIndexBySourcePath.clear();
   resultIndexByOutputPath.clear();
-  afterRenderMetaCache.clear();
-  pendingNormalizeItems.length = 0;
   state.selectedOutputPaths.clear();
-  renderLists();
+  renderListsSync();
+  
+  // before 리스트가 비워졌으므로 모니터 감지 버튼(apply) 상태를 업데이트하여 활성화합니다.
+  updateMonitorLabels();
+  
   setStatus(`원본 파일 목록 ${beforeCount}개, 변환된 파일 목록 ${afterCount}개를 초기화했습니다.`, "success");
 }
 
@@ -1938,7 +3347,6 @@ async function setupTauriFileDrop() {
           break;
         }
         case "leave":
-        case "cancel":
           state.beforeDragDepth = 0;
           setBeforeDropActive(false);
           break;
@@ -2007,14 +3415,18 @@ beforeList.addEventListener("click", (event) => {
       });
       state.beforeItems = state.beforeItems.filter((item) => !isPathInFolderTree(item.sourcePath, targetItem.sourcePath));
       recalculateFolderFileCounts();
-      renderLists();
+      renderListsSync();
+      
+      updateMonitorLabels();
       setStatus("폴더와 하위 파일 항목을 함께 삭제했습니다.", "success");
       return;
     }
     state.selectedBeforePaths.delete(targetItem.sourcePath);
     state.beforeItems.splice(targetIndex, 1);
     recalculateFolderFileCounts();
-    renderLists();
+    renderListsSync();
+
+    updateMonitorLabels();
     setStatus("원본 파일 목록 항목 1개를 삭제했습니다.", "success");
     return;
   }
@@ -2103,7 +3515,7 @@ afterList.addEventListener("dragstart", (event) => {
   }
 
   state.afterInternalDragActive = true;
-  const dragPaths = state.results.map((item) => item.outputPath).filter((path) => state.selectedOutputPaths.has(path));
+  const dragPaths = getSelectedAfterDragPaths();
   void window.desktopBridge.startFileDrag(dragPaths).catch((error) => {
     const message = error instanceof Error ? error.message : "파일 드래그 시작에 실패했습니다.";
     setStatus(message, "error");
@@ -2122,13 +3534,107 @@ centerRefreshButton.addEventListener("click", () => {
   clearAllItems();
 });
 
+monitorDirectoryPickButton.addEventListener("click", () => {
+  void chooseMonitorDirectory();
+});
+
+monitorApplyButton.addEventListener("click", () => {
+  void applyPendingMonitorChanges();
+});
+
+monitorDirectoryClearButton.addEventListener("click", () => {
+  const selectedPath = monitorDirectoryList.value;
+  if (!selectedPath) {
+    clearMonitorDirectory();
+    return;
+  }
+  void removeMonitorDirectory(selectedPath);
+});
+
 beforeFilterToggleButton.addEventListener("click", () => {
   state.beforeNfdOnly = !state.beforeNfdOnly;
-  renderLists();
+  renderListsSync();
 });
 
 themeToggleButton.addEventListener("click", () => {
   applyTheme(!state.darkMode, true);
+});
+
+launchAtLoginToggle.addEventListener("change", () => {
+  const nextEnabled = launchAtLoginToggle.checked;
+  launchAtLoginToggle.disabled = true;
+  void window.desktopBridge
+    .setLaunchAtLoginEnabled(nextEnabled)
+    .then(() => {
+      state.launchAtLoginEnabled = nextEnabled;
+      appendStatusLog(
+        nextEnabled ? "로그인시 자동 실행을 켰습니다." : "로그인시 자동 실행을 껐습니다.",
+        "success"
+      );
+      showCopyToast("설정 변경", [nextEnabled ? "로그인시 자동 실행: ON" : "로그인시 자동 실행: OFF"]);
+    })
+    .catch((error) => {
+      launchAtLoginToggle.checked = state.launchAtLoginEnabled;
+      const errorMessage = getErrorMessage(error, "설정 변경 실패");
+      appendStatusLog(
+        `로그인시 자동 실행 설정에 실패했습니다. 원인: ${errorMessage}`,
+        "error"
+      );
+      showCopyToast("설정 변경 실패", [`로그인시 자동 실행: ${errorMessage}`]);
+    })
+    .finally(() => {
+      syncAutomationSettingControls();
+    });
+});
+
+autoMonitorConvertToggle.addEventListener("change", () => {
+  state.autoMonitorConvertEnabled = autoMonitorConvertToggle.checked;
+  persistAutoMonitorConvertEnabled(state.autoMonitorConvertEnabled);
+  syncAutoConvertFilesUI();
+  
+  appendStatusLog(
+    state.autoMonitorConvertEnabled ? "자동 감지를 켰습니다." : "자동 감지를 껐습니다.",
+    "success"
+  );
+  showCopyToast("설정 변경", [state.autoMonitorConvertEnabled ? "백그라운드 자동 감지: ON" : "백그라운드 자동 감지: OFF"]);
+  
+  // 자동 감지 토글 변경 시 Watcher 폴링 상태도 동기화합니다.
+  if (state.autoMonitorConvertEnabled) {
+    scheduleInitialMonitorPolling(true);
+  } else {
+    stopMonitorPolling();
+    // 감지가 꺼지면 기존 대기열을 초기화하고 버튼을 "대상 찾기" 로 전환합니다.
+    monitorPendingEntriesByDirectory.clear();
+    state.monitorDirectoryPaths.forEach(p => monitorPendingEntriesByDirectory.set(p, []));
+    recomputeMonitorPendingState();
+    updateMonitorLabels();
+  }
+});
+
+autoConvertFilesToggle.addEventListener("change", () => {
+  state.autoConvertFilesEnabled = autoConvertFilesToggle.checked;
+  persistAutoConvertFilesEnabled(state.autoConvertFilesEnabled);
+  
+  appendStatusLog(
+    state.autoConvertFilesEnabled ? "자동 변환을 켰습니다." : "자동 변환을 껐습니다.",
+    "success"
+  );
+  showCopyToast("설정 변경", [state.autoConvertFilesEnabled ? "자동 변환: ON" : "자동 변환: OFF"]);
+  
+  // 자동 변환이 켜졌고 자동 감지도 켜져있다면, 현재 대기 중인 항목들을 즉시 변환 시도합니다.
+  if (state.autoMonitorConvertEnabled && state.autoConvertFilesEnabled) {
+    void (async () => {
+      try {
+        const pendingPaths = Array.from(state.monitorPendingPaths);
+        if (pendingPaths.length > 0) {
+          appendStatusLog(`자동 변환 켜짐: 대기 중인 ${pendingPaths.length}개 항목을 변환합니다.`, "idle");
+          await convertSourcePaths(pendingPaths, true);
+        }
+      } catch (e) {
+        appendStatusLog(`자동 변환 시작 중 오류: ${getErrorMessage(e, "알 수 없는 오류")}`, "error");
+      }
+    })();
+  }
 });
 
 copySelectionButton.addEventListener("click", () => {
@@ -2254,6 +3760,25 @@ window.addEventListener("blur", () => {
   hideBeforeContextMenu();
 });
 
+window.addEventListener("beforeunload", () => {
+  cancelPersistMonitorStateSchedule();
+  terminateMonitorPendingWorker();
+  stopMonitorPolling();
+  if (monitorWatchEventUnsubscribe) {
+    monitorWatchEventUnsubscribe();
+    monitorWatchEventUnsubscribe = null;
+  }
+  if (monitorWatchErrorUnsubscribe) {
+    monitorWatchErrorUnsubscribe();
+    monitorWatchErrorUnsubscribe = null;
+  }
+  if (mainWindowVisibilityUnsubscribe) {
+    mainWindowVisibilityUnsubscribe();
+    mainWindowVisibilityUnsubscribe = null;
+  }
+  monitorWatchListenersReady = false;
+});
+
 beforeList.addEventListener("contextmenu", (event) => {
   event.preventDefault();
   if (state.beforeItems.length === 0) {
@@ -2287,14 +3812,85 @@ beforeContextClearButton.addEventListener("click", () => {
   const beforeCount = state.beforeItems.length;
   state.beforeItems = [];
   state.selectedBeforePaths.clear();
-  beforeRenderMetaCache.clear();
-  renderLists();
+  renderListsSync();
+  updateMonitorLabels();
   setStatus(`원본 파일 목록 ${beforeCount}개를 전체 삭제했습니다.`, "success");
 });
 
-renderLists();
+renderListsSync();
 updateScrollFades();
 initializeTheme();
+initializeAutoMonitorConvertSetting();
+syncAutomationSettingControls();
+updateTrayBackgroundBadge(0);
+void initializeLaunchAtLoginSetting();
 setupSystemThemeWatcher();
-void setupTauriFileDrop();
 appendStatusLog("앱이 준비되었습니다.");
+window.setTimeout(() => {
+  loadPretendardStylesheet();
+}, 0);
+
+window.requestAnimationFrame(() => {
+  window.requestAnimationFrame(() => {
+    window.setTimeout(() => {
+      void setupTauriFileDrop();
+      void initializeMonitoring();
+    }, 200);
+  });
+});
+
+async function initializeMonitoring() {
+  updateMonitorLabels();
+  try {
+    state.monitorDirectoryPaths = await loadPersistedMonitorState();
+    updateMonitorLabels();
+    void scheduleAutoMonitorConvertIfNeeded();
+    if (state.monitorDirectoryPaths.some((path) => monitorBaselines.has(path))) {
+      scheduleInitialMonitorPolling(false);
+    }
+    scheduleMonitorSnapshotCheck(Math.min(MONITOR_START_DELAY_MS, 1000));
+  } catch (error) {
+    state.monitorDirectoryPaths = [];
+    monitorBaselines.clear();
+    monitorLastSnapshotAt.clear();
+    monitorPendingEntriesByDirectory.clear();
+    monitorDirectoryBookmarks.clear();
+    recomputeMonitorPendingState();
+    updateMonitorLabels();
+    const message = withMonitorPermissionGuidance(getErrorMessage(error, "모니터링 상태를 복원하지 못했습니다."));
+    appendStatusLog(`모니터링 상태 복원에 실패했습니다. 원인: ${message}`, "error");
+  }
+}
+
+void window.desktopBridge.onMainWindowVisibility((visible) => {
+  const previousVisible = state.mainWindowVisible;
+  state.mainWindowVisible = visible;
+  updateAutoConvertForegroundOverlay();
+  if (previousVisible === visible) {
+    return;
+  }
+  if (!state.autoMonitorConvertEnabled) {
+    return;
+  }
+
+  if (visible) {
+    updateTrayBackgroundBadge(0);
+    stopMonitorPolling();
+    updateMonitorLabels();
+    appendStatusLog("포그라운드 전환으로 자동 감지를 일시 중지했습니다.", "idle");
+    return;
+  }
+
+  if (state.monitorDirectoryPaths.length === 0) {
+    return;
+  }
+  appendStatusLog("백그라운드 전환으로 자동 감지를 다시 시작합니다.", "idle");
+  scheduleInitialMonitorPolling(false);
+}).then((unsubscribe) => {
+  mainWindowVisibilityUnsubscribe = unsubscribe;
+}).catch((error) => {
+  appendStatusLog(
+    `메인 창 상태 이벤트 등록에 실패했습니다. 원인: ${getErrorMessage(error, "창 상태 이벤트 실패")}`,
+    "error"
+  );
+});
