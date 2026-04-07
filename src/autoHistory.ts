@@ -4,6 +4,8 @@ import { getErrorMessage, toWindowsPreviewBefore } from "./utils/path";
 import heroArrowRight from "./icons/hero/arrow-right.svg?raw";
 
 const THEME_STORAGE_KEY = "file-path-renamer-theme";
+const AUTO_CONVERT_HISTORY_WARN_THRESHOLD = 1000;
+let clearHistoryInFlight = false;
 
 function getAppElement() {
   const appElement = document.querySelector<HTMLDivElement>("#app");
@@ -55,11 +57,29 @@ function applyTheme() {
   document.body.classList.toggle("theme-dark", theme === "dark");
 }
 
+async function confirmHistoryClear() {
+  const message = "자동 변환 내역을 모두 초기화할까요?";
+  try {
+    const { confirm } = await import("@tauri-apps/plugin-dialog");
+    return await confirm(message, {
+      title: "내역 초기화",
+      kind: "warning",
+      okLabel: "초기화",
+      cancelLabel: "취소"
+    });
+  } catch {
+    const fallback = window.confirm(message);
+    if (typeof (fallback as unknown as Promise<boolean>)?.then === "function") {
+      return await (fallback as unknown as Promise<boolean>);
+    }
+    return Boolean(fallback);
+  }
+}
+
 function render(entries: AutoConvertHistoryEntry[]) {
   const sortedEntries = entries
     .slice()
     .reverse()
-    .slice(0, 500)
     .map((entry, idx) => ({ entry, idx }));
 
   const rows = sortedEntries
@@ -109,6 +129,14 @@ function render(entries: AutoConvertHistoryEntry[]) {
     </div>
   `;
 
+  const overLimitNotice = entries.length > AUTO_CONVERT_HISTORY_WARN_THRESHOLD
+    ? `
+      <div class="mt-2 rounded-lg border border-rose-200 bg-rose-50 px-3 py-2 text-[11px] font-medium text-rose-700">
+        내역이 ${entries.length.toLocaleString("en-US")}개로 1,000개를 초과했습니다. 성능/용량 보호를 위해 내역 초기화를 권장합니다.
+      </div>
+    `
+    : "";
+
   return `
     <main id="auto-history-root" class="flex h-screen flex-col gap-3 overflow-hidden bg-stone-100 p-3 text-stone-900">
       <section id="auto-history-header" class="rounded-2xl border border-stone-200/80 bg-white/90 p-4 shadow-soft backdrop-blur">
@@ -116,7 +144,7 @@ function render(entries: AutoConvertHistoryEntry[]) {
           <div>
             <p class="text-[12px] font-semibold uppercase tracking-[0.18em] text-stone-400">History</p>
             <h1 id="auto-history-title" class="text-sm font-semibold text-stone-900">백그라운드 자동 변환 내역</h1>
-            <p class="mt-0.5 text-[11px] text-stone-500">최근 500개 내역만 조회할 수 있습니다.</p>
+            <p class="mt-0.5 text-[11px] text-stone-500">내역은 사용자가 초기화할 때까지 유지됩니다.</p>
           </div>
           <button
             id="clear-history"
@@ -127,13 +155,14 @@ function render(entries: AutoConvertHistoryEntry[]) {
             확인 및 초기화
           </button>
         </div>
+        ${overLimitNotice}
       </section>
       <section id="auto-history-list-card" class="min-h-0 flex-1 rounded-2xl border border-stone-200 bg-white/95 p-3 shadow-soft">
         <div
           id="auto-history-list"
           class="${hasRows
             ? "scroll-fade grid h-full content-start auto-rows-max gap-1 overflow-y-auto pr-3 [scrollbar-gutter:stable]"
-            : "scroll-fade h-full overflow-y-auto pr-3 [scrollbar-gutter:stable]"}"
+            : "scroll-fade h-full overflow-y-auto"}"
         >
           ${rowsHtml || empty}
         </div>
@@ -169,18 +198,29 @@ async function loadAndRender() {
   });
 
   clearButton?.addEventListener("click", async () => {
-    if (entries.length === 0) {
+    if (clearHistoryInFlight) {
       return;
     }
-    const confirmed = window.confirm("자동 변환 내역을 모두 초기화할까요?");
+    const latestEntries = await desktopBridge.loadAutoConvertHistory();
+    if (latestEntries.length === 0) {
+      await loadAndRender();
+      return;
+    }
+    const confirmed = await confirmHistoryClear();
     if (!confirmed) {
       return;
     }
     try {
+      clearHistoryInFlight = true;
+      if (clearButton) {
+        clearButton.disabled = true;
+      }
       await desktopBridge.clearAutoConvertHistory();
       await loadAndRender();
     } catch (error) {
       alert(`내역 초기화에 실패했습니다: ${getErrorMessage(error, "초기화 실패")}`);
+    } finally {
+      clearHistoryInFlight = false;
     }
   });
 }

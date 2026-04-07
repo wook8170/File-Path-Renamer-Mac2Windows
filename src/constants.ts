@@ -16,7 +16,7 @@ export const LIST_CLASS_VIRTUAL =
   "virtual-list-host scroll-fade relative h-[460px] max-h-[460px] min-h-[460px] overflow-y-auto overflow-x-hidden pl-2 pr-4 py-2 [scrollbar-gutter:stable]";
 export const VIRTUAL_LIST_THRESHOLD = 80;
 export const VIRTUAL_ROW_HEIGHT = 44;
-export const VIRTUAL_OVERSCAN = 48;
+export const VIRTUAL_OVERSCAN = 20;
 export const AUTO_MONITOR_CONVERT_STORAGE_KEY = "file-path-renamer-auto-monitor-convert";
 export const AUTO_CONVERT_FILES_STORAGE_KEY = "file-path-renamer-auto-convert-files";
 export const THEME_STORAGE_KEY = "file-path-renamer-theme";

@@ -50,6 +50,7 @@ import type {
   BeforeItem,
   MonitorBaseline,
   MonitorDirectoryInfo,
+  MonitorApplyMode,
   NormalizeResult,
   StatusTone
 } from "./types";
@@ -99,6 +100,7 @@ const state: AppState = {
   mainWindowVisible: true,
   monitorDirectoryPaths: [] as string[],
   monitorPendingPaths: new Set<string>(),
+  monitorApplyMode: "findTargets",
   monitorPendingFileCount: 0,
   monitorPendingDirectoryCount: 0,
   monitorProgressMessage: "",
@@ -462,8 +464,9 @@ app.innerHTML = `
     class="pointer-events-none fixed inset-0 z-[160] hidden items-center justify-center bg-stone-900/18 backdrop-blur-[1px]"
     aria-hidden="true"
   >
-    <div class="rounded-xl border border-stone-200 bg-white/95 px-4 py-2 shadow-lg">
-      <p id="app-loading-message" class="text-[12px] font-medium text-stone-700">작업을 처리하고 있습니다...</p>
+    <div class="inline-flex items-center gap-2 rounded-xl border border-stone-200 bg-white/95 px-4 py-2 shadow-lg">
+      <span class="h-3.5 w-3.5 animate-spin rounded-full border-2 border-sky-200 border-t-sky-500"></span>
+      <p id="app-loading-message" class="text-[12px] font-semibold text-stone-700">작업을 처리하고 있습니다...</p>
     </div>
   </div>
 `;
@@ -601,26 +604,27 @@ let lastMonitorStatusMessage = "";
 let monitorStartTimerId = 0;
 let monitorSnapshotCheckTimerId = 0;
 let monitorStartGeneration = 0;
-const ENABLE_MONITOR_BG_UI_BLOCKER = false;
+const ENABLE_MONITOR_BG_UI_BLOCKER = true;
 const MONITOR_STATE_SAVE_DEBOUNCE_MS = 1500;
-type MonitorPendingWorkerRequest = {
-  requestId: number;
-  retainedPendingEntries: MonitorSnapshotEntry[];
-  candidateEntries: MonitorSnapshotEntry[];
-  changedPaths: string[];
-  isIncrementalRefresh: boolean;
-};
+const AUTO_CONVERT_HISTORY_WARN_THRESHOLD = 1000;
+const AUTO_CONVERT_HISTORY_PROMPT_COOLDOWN_MS = 60_000;
+type MonitorPendingWorkerRequest =
+  | { type: 'setBaseline'; path: string; snapshot: MonitorSnapshotEntry[]; lastSnapshotAt: number }
+  | { type: 'getBaseline'; requestId: number; path: string }
+  | { type: 'deleteBaseline'; path: string }
+  | { type: 'recalculatePending'; requestId: number; path: string; scannedEntries: MonitorSnapshotEntry[]; isIncremental: boolean; pathsToScan: string[]; currentPending: MonitorSnapshotEntry[] }
+  | { type: 'clearBaselines' };
 
-type MonitorPendingWorkerResponse = {
-  requestId: number;
-  pendingEntries: MonitorSnapshotEntry[];
-};
+type MonitorPendingWorkerResponse =
+  | { type: 'baselineGot'; requestId: number; snapshot: MonitorSnapshotEntry[] }
+  | { type: 'recalculateResult'; requestId: number; pendingEntries: MonitorSnapshotEntry[] }
+  | { type: 'error'; requestId: number; error: string };
 
 let monitorPendingWorker: Worker | null = null;
 let monitorPendingWorkerRequestId = 0;
 const monitorPendingWorkerResolvers = new Map<
   number,
-  { resolve: (entries: MonitorSnapshotEntry[]) => void; reject: (reason?: unknown) => void }
+  { resolve: (data: any) => void; reject: (reason?: unknown) => void }
 >();
 let monitorBackgroundTaskCount = 0;
 let monitorBackgroundError = false;
@@ -637,10 +641,12 @@ let pretendardLoaded = false;
 let monitorStateSaveTimerId = 0;
 let monitorStateSaveInFlight = false;
 let monitorStateSaveQueued = false;
-let trayBackgroundConvertedCount = 0;
 let autoConvertHistoryCount = 0;
+let autoConvertHistoryPromptInFlight = false;
+let autoConvertHistoryLastPromptAt = 0;
 let beforeVirtualLoadingTimerId = 0;
 let afterVirtualLoadingTimerId = 0;
+let suppressAfterScrollVirtualRender = false;
 const systemThemeMediaQuery = window.matchMedia("(prefers-color-scheme: dark)");
 
 function ensureMonitorPendingWorker() {
@@ -660,12 +666,20 @@ function ensureMonitorPendingWorker() {
 
   monitorPendingWorker.onmessage = (event: MessageEvent<MonitorPendingWorkerResponse>) => {
     const payload = event.data;
+    if (!('requestId' in payload)) return;
     const resolver = monitorPendingWorkerResolvers.get(payload.requestId);
     if (!resolver) {
       return;
     }
     monitorPendingWorkerResolvers.delete(payload.requestId);
-    resolver.resolve(payload.pendingEntries);
+    
+    if (payload.type === 'error') {
+      resolver.reject(new Error(payload.error));
+    } else if (payload.type === 'baselineGot') {
+      resolver.resolve(payload.snapshot);
+    } else if (payload.type === 'recalculateResult') {
+      resolver.resolve(payload.pendingEntries);
+    }
   };
 
   monitorPendingWorker.onerror = (event) => {
@@ -679,6 +693,16 @@ function ensureMonitorPendingWorker() {
       monitorPendingWorker = null;
     }
   };
+
+  // Worker가 재생성된 경우에도 감지 기준선을 잃지 않도록 즉시 baseline을 재주입한다.
+  for (const [path, baseline] of monitorBaselines.entries()) {
+    monitorPendingWorker.postMessage({
+      type: "setBaseline",
+      path,
+      snapshot: Array.from(baseline.byPath.values()),
+      lastSnapshotAt: monitorLastSnapshotAt.get(path) ?? 0
+    });
+  }
 
   return monitorPendingWorker;
 }
@@ -694,42 +718,79 @@ function terminateMonitorPendingWorker() {
   monitorPendingWorkerResolvers.clear();
 }
 
-async function calculatePendingEntries(
-  retainedPendingEntries: MonitorSnapshotEntry[],
-  candidateEntries: MonitorSnapshotEntry[],
-  changedPaths: string[],
-  isIncrementalRefresh: boolean
-) {
+async function setWorkerBaseline(path: string, snapshot: MonitorSnapshotEntry[], lastSnapshotAt: number) {
+  monitorBaselines.set(path, buildMonitorBaseline(snapshot));
+  const worker = ensureMonitorPendingWorker();
+  if (worker) worker.postMessage({ type: 'setBaseline', path, snapshot, lastSnapshotAt });
+}
+
+async function getWorkerBaseline(path: string): Promise<MonitorSnapshotEntry[]> {
   const worker = ensureMonitorPendingWorker();
   if (!worker) {
-    const changedPathSet = new Set(changedPaths);
-    const inspectedPendingEntries = candidateEntries.filter((entry) =>
-      changedPathSet.has(entry.path)
-    );
-    const merged = isIncrementalRefresh
-      ? [...retainedPendingEntries, ...inspectedPendingEntries]
-      : inspectedPendingEntries;
-    return collapseMonitorPendingEntries(merged);
+    return Array.from(monitorBaselines.get(path)?.byPath.values() ?? []);
   }
-
   const requestId = ++monitorPendingWorkerRequestId;
-  const payload: MonitorPendingWorkerRequest = {
-    requestId,
-    retainedPendingEntries,
-    candidateEntries,
-    changedPaths,
-    isIncrementalRefresh
+  return new Promise((resolve, reject) => {
+    monitorPendingWorkerResolvers.set(requestId, { resolve, reject });
+    worker.postMessage({ type: 'getBaseline', requestId, path });
+  });
+}
+
+async function deleteWorkerBaseline(path: string) {
+  monitorBaselines.delete(path);
+  const worker = ensureMonitorPendingWorker();
+  if (worker) worker.postMessage({ type: 'deleteBaseline', path });
+}
+
+async function clearWorkerBaselines() {
+  monitorBaselines.clear();
+  const worker = ensureMonitorPendingWorker();
+  if (worker) worker.postMessage({ type: 'clearBaselines' });
+}
+
+async function calculatePendingEntriesWorker(
+  path: string,
+  scannedEntries: MonitorSnapshotEntry[],
+  isIncremental: boolean,
+  pathsToScan: string[],
+  currentPending: MonitorSnapshotEntry[]
+): Promise<MonitorSnapshotEntry[]> {
+  const requestOnWorker = (worker: Worker) => {
+    const requestId = ++monitorPendingWorkerRequestId;
+    return new Promise<MonitorSnapshotEntry[]>((resolve, reject) => {
+      monitorPendingWorkerResolvers.set(requestId, { resolve, reject });
+      worker.postMessage({
+        type: "recalculatePending",
+        requestId,
+        path,
+        scannedEntries,
+        isIncremental,
+        pathsToScan,
+        currentPending
+      });
+    });
   };
 
-  return await new Promise<MonitorSnapshotEntry[]>((resolve, reject) => {
-    monitorPendingWorkerResolvers.set(requestId, { resolve, reject });
-    try {
-      worker.postMessage(payload);
-    } catch (error) {
-      monitorPendingWorkerResolvers.delete(requestId);
-      reject(error);
+  const worker = ensureMonitorPendingWorker();
+  if (!worker) {
+    return currentPending;
+  }
+
+  try {
+    return await requestOnWorker(worker);
+  } catch {
+    // worker 장애 시 1회 재생성/재시도로 복구한다. 감지 계산은 메인 스레드로 내리지 않는다.
+    terminateMonitorPendingWorker();
+    const retryWorker = ensureMonitorPendingWorker();
+    if (!retryWorker) {
+      return currentPending;
     }
-  });
+    try {
+      return await requestOnWorker(retryWorker);
+    } catch {
+      return currentPending;
+    }
+  }
 }
 
 function isRelevantMonitorWatchKind(kind: string) {
@@ -845,8 +906,93 @@ function syncAutomationSettingControls() {
 }
 
 function updateAutoConvertHistoryBadge() {
-  autoConvertHistoryBadge.textContent = autoConvertHistoryCount > 99 ? "99+" : String(autoConvertHistoryCount);
+  autoConvertHistoryBadge.textContent = Math.max(0, autoConvertHistoryCount).toLocaleString("en-US");
   autoConvertHistoryBadge.classList.toggle("hidden", autoConvertHistoryCount <= 0);
+}
+
+async function maybePromptAutoConvertHistoryCleanup(count: number, reason: string) {
+  if (count <= AUTO_CONVERT_HISTORY_WARN_THRESHOLD) {
+    return;
+  }
+  if (autoConvertHistoryPromptInFlight) {
+    return;
+  }
+  const now = Date.now();
+  if (now - autoConvertHistoryLastPromptAt < AUTO_CONVERT_HISTORY_PROMPT_COOLDOWN_MS) {
+    return;
+  }
+  autoConvertHistoryLastPromptAt = now;
+  autoConvertHistoryPromptInFlight = true;
+  const countText = count.toLocaleString("en-US");
+  try {
+    appendStatusLog(
+      `자동 변환 내역이 ${countText}개로 1,000개를 초과했습니다(${reason}). 내역 초기화를 권장합니다.`,
+      "error"
+    );
+    showTaskToast(
+      `자동 변환 내역 ${countText}개(1,000개 초과). 내역 초기화가 필요합니다.`,
+      "error"
+    );
+
+    const message = `자동 변환 내역이 ${countText}개로 1,000개를 초과했습니다.\n성능/용량 보호를 위해 지금 내역을 초기화할까요?`;
+    let shouldClear = false;
+    try {
+      const { confirm } = await import("@tauri-apps/plugin-dialog");
+      shouldClear = await confirm(message, {
+        title: "자동 변환 내역 정리 필요",
+        kind: "warning",
+        okLabel: "지금 초기화",
+        cancelLabel: "나중에"
+      });
+    } catch {
+      shouldClear = window.confirm(message);
+    }
+
+    if (shouldClear) {
+      await window.desktopBridge.clearAutoConvertHistory();
+      appendStatusLog("자동 변환 내역을 초기화했습니다.", "success");
+      showTaskToast("자동 변환 내역을 초기화했습니다.", "success");
+      return;
+    }
+
+    void window.desktopBridge.openAutoConvertHistoryWindow().catch(() => {
+      // 내역 창 열기 실패는 안내 흐름을 막지 않는다.
+    });
+  } finally {
+    autoConvertHistoryPromptInFlight = false;
+  }
+}
+
+function resolveMonitorApplyMode(pendingCount: number): MonitorApplyMode {
+  return pendingCount > 0 ? "addDetectedTargets" : "findTargets";
+}
+
+function isPathEqualOrDescendantInSet(path: string, candidates: Set<string>) {
+  if (candidates.size === 0) {
+    return false;
+  }
+  const normalized = normalizePathForCompare(path);
+  if (normalized.length === 0) {
+    return false;
+  }
+  if (candidates.has(normalized)) {
+    return true;
+  }
+  if (normalized.startsWith("/") && candidates.has("/")) {
+    return true;
+  }
+  let cursor = normalized;
+  while (cursor.length > 1) {
+    const separatorIndex = cursor.lastIndexOf("/");
+    if (separatorIndex <= 0) {
+      break;
+    }
+    cursor = cursor.slice(0, separatorIndex);
+    if (candidates.has(cursor)) {
+      return true;
+    }
+  }
+  return false;
 }
 
 function clearMonitorPendingEntriesByPaths(paths: string[]) {
@@ -854,15 +1000,17 @@ function clearMonitorPendingEntriesByPaths(paths: string[]) {
     return;
   }
 
-  const normalizedPaths = Array.from(new Set(paths.map((path) => normalizePathForCompare(path))));
+  const normalizedPathSet = new Set(
+    paths
+      .map((path) => normalizePathForCompare(path))
+      .filter((path) => path.length > 0)
+  );
+  if (normalizedPathSet.size === 0) {
+    return;
+  }
   let changed = false;
   for (const [rootPath, entries] of monitorPendingEntriesByDirectory.entries()) {
-    const nextEntries = entries.filter((entry) => {
-      const entryPath = normalizePathForCompare(entry.path);
-      return !normalizedPaths.some(
-        (pendingPath) => entryPath === pendingPath || isPathInFolderTree(entryPath, pendingPath)
-      );
-    });
+    const nextEntries = entries.filter((entry) => !isPathEqualOrDescendantInSet(entry.path, normalizedPathSet));
     if (nextEntries.length !== entries.length) {
       monitorPendingEntriesByDirectory.set(rootPath, nextEntries);
       changed = true;
@@ -925,7 +1073,7 @@ async function filterAlreadyHandledMonitorPendingPaths(
   const pathsToEnqueue: string[] = [];
   const excludedPaths: string[] = [];
   for (const entry of normalizedPending) {
-    if (excludeExactSet.has(entry.normalized)) {
+    if (isPathEqualOrDescendantInSet(entry.normalized, excludeExactSet)) {
       excludedPaths.push(entry.original);
       continue;
     }
@@ -955,14 +1103,20 @@ async function scheduleAutoMonitorConvertIfNeeded() {
 
     // 자동 감지 + 자동 변환은 앱이 백그라운드일 때만 수행한다.
     if (state.autoMonitorConvertEnabled && state.autoConvertFilesEnabled && !state.mainWindowVisible) {
+      const pendingPaths = pendingEntries.map((entry) => entry.path);
+      const { pathsToEnqueue, excludedPaths } = await filterAlreadyHandledMonitorPendingPaths(pendingPaths);
+      if (excludedPaths.length > 0) {
+        clearMonitorPendingEntriesByPaths(excludedPaths);
+      }
+      if (pathsToEnqueue.length === 0) {
+        appendStatusLog("자동 감지: before/after/내역 중복 항목을 제외한 변환 대상이 없습니다.", "idle");
+        return;
+      }
       appendStatusLog(
-        `자동 감지: ${pendingEntries.length}개 항목 변환을 시도합니다.`,
+        `자동 감지: ${pathsToEnqueue.length}개 항목 변환을 시도합니다.`,
         "idle"
       );
-      await convertSourcePaths(
-        pendingEntries.map((entry) => entry.path),
-        true
-      );
+      await convertSourcePaths(pathsToEnqueue, true);
     }
   } finally {
     state.monitorAutoConvertRunning = false;
@@ -1045,7 +1199,6 @@ function loadPretendardStylesheet() {
 
 function updateTrayBackgroundBadge(count: number) {
   const normalized = Math.max(0, Math.floor(count));
-  trayBackgroundConvertedCount = normalized;
   void window.desktopBridge.setTrayBadgeCount(normalized).catch(() => {
     // 트레이 배지 갱신 실패는 앱 동작에 영향을 주지 않도록 무시한다.
   });
@@ -1122,10 +1275,6 @@ function beginMonitorBackgroundTask() {
   monitorBackgroundErrorMessage = "";
   updateMonitorProgressDisplay();
   updateMonitorLabels();
-
-  if (ENABLE_MONITOR_BG_UI_BLOCKER && monitorBackgroundTaskCount === 1) {
-    setAppLoadingOverlay(true, state.monitorProgressMessage || "백그라운드 작업 중...");
-  }
 }
 
 function endMonitorBackgroundTask(success = true, errorMessage = "") {
@@ -1137,9 +1286,8 @@ function endMonitorBackgroundTask(success = true, errorMessage = "") {
     monitorBackgroundError = false;
     monitorBackgroundErrorMessage = "";
   }
-  if (ENABLE_MONITOR_BG_UI_BLOCKER && monitorBackgroundTaskCount === 0) {
+  if (monitorBackgroundTaskCount === 0) {
     state.monitorProgressMessage = "";
-    setAppLoadingOverlay(false);
   }
   updateMonitorProgressDisplay();
   updateMonitorLabels();
@@ -1295,7 +1443,7 @@ function updateAutoConvertForegroundOverlay() {
     );
     return;
   }
-  if (!ENABLE_MONITOR_BG_UI_BLOCKER) {
+  if (monitorBackgroundTaskCount === 0) {
     setAppLoadingOverlay(false, "", true);
   }
 }
@@ -1417,19 +1565,24 @@ function getFolderMetaTextClass(isSelected: boolean) {
 
 async function persistMonitorState() {
   const uniqueValues = Array.from(new Set(state.monitorDirectoryPaths.filter((value) => value.trim().length > 0)));
-  const entries: MonitorStateEntry[] = uniqueValues.map((path) => ({
-    path,
-    lastSnapshotAt: monitorLastSnapshotAt.get(path) ?? null,
-    snapshotEntries: Array.from(monitorBaselines.get(path)?.byPath.values() ?? []),
-    pendingEntries: monitorPendingEntriesByDirectory.get(path) ?? [],
-    bookmarkData: monitorDirectoryBookmarks.get(path) ?? null
-  }));
+  const entries: MonitorStateEntry[] = [];
+  for (const path of uniqueValues) {
+    const snapshotEntries = await getWorkerBaseline(path);
+    entries.push({
+      path,
+      lastSnapshotAt: monitorLastSnapshotAt.get(path) ?? null,
+      snapshotEntries,
+      pendingEntries: monitorPendingEntriesByDirectory.get(path) ?? [],
+      bookmarkData: monitorDirectoryBookmarks.get(path) ?? null
+    });
+  }
   await window.desktopBridge.saveMonitorState(entries);
 }
 
 async function loadPersistedMonitorState() {
   monitorLastSnapshotAt.clear();
   monitorBaselines.clear();
+  clearWorkerBaselines();
   monitorPendingEntriesByDirectory.clear();
   monitorDirectoryBookmarks.clear();
   const entries = await window.desktopBridge.loadMonitorState();
@@ -1443,7 +1596,7 @@ async function loadPersistedMonitorState() {
       monitorLastSnapshotAt.set(entry.path, entry.lastSnapshotAt);
     }
     if (entry.snapshotEntries.length > 0) {
-      monitorBaselines.set(entry.path, buildMonitorBaseline(entry.snapshotEntries));
+      setWorkerBaseline(entry.path, entry.snapshotEntries, entry.lastSnapshotAt ?? 0);
     }
     if (entry.pendingEntries.length > 0) {
       monitorPendingEntriesByDirectory.set(entry.path, collapseMonitorPendingEntries(entry.pendingEntries));
@@ -1536,8 +1689,10 @@ function recomputeMonitorPendingState() {
   });
 
   state.monitorPendingPaths = uniquePaths;
+  state.monitorApplyMode = resolveMonitorApplyMode(uniquePaths.size);
   state.monitorPendingFileCount = pendingFileCount;
   state.monitorPendingDirectoryCount = pendingDirectoryCount;
+  updateTrayBackgroundBadge(uniquePaths.size);
   
   checkMonitorStatusLog();
 }
@@ -1640,11 +1795,14 @@ function updateMonitorLabels() {
   monitorDirectoryList.disabled = state.busy || state.monitorDirectoryPaths.length === 0;
   
   const pendingBadgeCount = Math.max(0, state.monitorPendingPaths.size);
+  const monitorApplyMode = resolveMonitorApplyMode(pendingBadgeCount);
+  state.monitorApplyMode = monitorApplyMode;
+  const monitorApplyLabelText = monitorApplyMode === "addDetectedTargets" ? "변환 대상으로 추가" : "변환 대상 찾기";
   monitorApplyButton.disabled = state.busy || state.monitorDirectoryPaths.length === 0;
-  monitorApplyButton.setAttribute("aria-label", "변환 대상 찾기");
-  monitorApplyButton.title = "변환 대상 찾기";
-  monitorApplyLabel.textContent = "변환 대상 찾기";
-  monitorApplyBadge.textContent = pendingBadgeCount > 99 ? "99+" : String(pendingBadgeCount);
+  monitorApplyButton.setAttribute("aria-label", monitorApplyLabelText);
+  monitorApplyButton.title = monitorApplyLabelText;
+  monitorApplyLabel.textContent = monitorApplyLabelText;
+  monitorApplyBadge.textContent = pendingBadgeCount.toLocaleString("en-US");
   monitorApplyBadge.classList.toggle("hidden", pendingBadgeCount === 0);
   monitorActivityIndicator.classList.remove(
     "border-stone-400/70",
@@ -1974,6 +2132,31 @@ function renderAfterCard(item: NormalizeResult, index: number) {
   `;
 }
 
+type VirtualScaffold = {
+  host: HTMLDivElement;
+  rows: HTMLDivElement;
+};
+
+function ensureVirtualScaffold(list: HTMLDivElement) {
+  const existing = list.querySelector<HTMLDivElement>("[data-virtual-host='true']");
+  const existingRows = existing?.querySelector<HTMLDivElement>("[data-virtual-rows='true']");
+  if (existing && existingRows) {
+    return { host: existing, rows: existingRows } satisfies VirtualScaffold;
+  }
+
+  const host = document.createElement("div");
+  host.className = "relative z-10";
+  host.dataset.virtualHost = "true";
+
+  const rows = document.createElement("div");
+  rows.dataset.virtualRows = "true";
+  host.appendChild(rows);
+
+  list.textContent = "";
+  list.appendChild(host);
+  return { host, rows } satisfies VirtualScaffold;
+}
+
 function renderVirtualBeforeList(entries: Array<{ item: BeforeItem; originalIndex: number }>) {
   const totalHeight = entries.length * VIRTUAL_ROW_HEIGHT;
   const maxScrollTop = Math.max(0, totalHeight - beforeList.clientHeight);
@@ -1989,18 +2172,23 @@ function renderVirtualBeforeList(entries: Array<{ item: BeforeItem; originalInde
   }
   beforeList.dataset.rangeKey = rangeKey;
 
-  const visibleHtml = entries
-    .slice(startIndex, endIndex)
-    .map((entry, offset) => {
-      const actualIndex = startIndex + offset;
-      return `<div style="position:absolute;left:0;right:0;top:${actualIndex * VIRTUAL_ROW_HEIGHT}px;">${renderBeforeCard(entry, actualIndex)}</div>`;
-    })
-    .join("");
-
   beforeList.className = LIST_CLASS_VIRTUAL;
   beforeList.classList.remove("virtual-scroll-loading");
   beforeList.dataset.loadingLabel = "로딩중...";
-  beforeList.innerHTML = `<div class="relative z-10" style="height:${totalHeight}px">${visibleHtml}</div>`;
+  const scaffold = ensureVirtualScaffold(beforeList);
+  scaffold.host.style.height = `${totalHeight}px`;
+
+  const fragment = document.createDocumentFragment();
+  for (let actualIndex = startIndex; actualIndex < endIndex; actualIndex += 1) {
+    const wrapper = document.createElement("div");
+    wrapper.style.position = "absolute";
+    wrapper.style.left = "0";
+    wrapper.style.right = "0";
+    wrapper.style.top = `${actualIndex * VIRTUAL_ROW_HEIGHT}px`;
+    wrapper.innerHTML = renderBeforeCard(entries[actualIndex], actualIndex);
+    fragment.appendChild(wrapper);
+  }
+  scaffold.rows.replaceChildren(fragment);
 }
 
 function renderVirtualAfterList(items: NormalizeResult[]) {
@@ -2018,26 +2206,32 @@ function renderVirtualAfterList(items: NormalizeResult[]) {
   }
   afterList.dataset.rangeKey = rangeKey;
 
-  const visibleHtml = items
-    .slice(startIndex, endIndex)
-    .map((item, offset) => {
-      const actualIndex = startIndex + offset;
-      return `<div style="position:absolute;left:0;right:0;top:${actualIndex * VIRTUAL_ROW_HEIGHT}px;">${renderAfterCard(item, actualIndex)}</div>`;
-    })
-    .join("");
-
   afterList.className = LIST_CLASS_VIRTUAL;
   afterList.classList.remove("virtual-scroll-loading");
   afterList.dataset.loadingLabel = "로딩중...";
-  afterList.innerHTML = `<div class="relative z-10" style="height:${totalHeight}px">${visibleHtml}</div>`;
+  const scaffold = ensureVirtualScaffold(afterList);
+  scaffold.host.style.height = `${totalHeight}px`;
+
+  const fragment = document.createDocumentFragment();
   afterCardElementMap.clear();
-  afterList.querySelectorAll<HTMLElement>(".after-card").forEach((element) => {
-    const outputPath = element.dataset.outputPath;
-    if (outputPath) {
-      afterCardElementMap.set(outputPath, element);
+  for (let actualIndex = startIndex; actualIndex < endIndex; actualIndex += 1) {
+    const wrapper = document.createElement("div");
+    wrapper.style.position = "absolute";
+    wrapper.style.left = "0";
+    wrapper.style.right = "0";
+    wrapper.style.top = `${actualIndex * VIRTUAL_ROW_HEIGHT}px`;
+    wrapper.innerHTML = renderAfterCard(items[actualIndex], actualIndex);
+    const card = wrapper.firstElementChild as HTMLElement | null;
+    if (card) {
+      const outputPath = card.dataset.outputPath;
+      if (outputPath) {
+        afterCardElementMap.set(outputPath, card);
+      }
+      card.setAttribute("draggable", "true");
     }
-    element.setAttribute("draggable", "true");
-  });
+    fragment.appendChild(wrapper);
+  }
+  scaffold.rows.replaceChildren(fragment);
 }
 
 function showVirtualLoading(target: "before" | "after") {
@@ -2408,7 +2602,7 @@ function renderLists() {
   beforeFilterToggleKnob.classList.toggle("translate-x-5", state.beforeNfdOnly);
   beforeFilterToggleText.textContent = "NFD만 보기";
   centerRefreshButton.disabled = state.busy || (state.beforeItems.length === 0 && state.results.length === 0);
-  updateMonitorLabels();
+  updateCenterConvertButtonState();
 
   const beforeVisibleEntries = state.beforeItems
     .map((item, originalIndex) => ({ item, originalIndex }))
@@ -2498,6 +2692,27 @@ function updateScrollFades() {
   updateScrollFadeState(afterList);
 }
 
+function shouldStickAfterListToBottom() {
+  const maxScrollTop = Math.max(0, afterList.scrollHeight - afterList.clientHeight);
+  if (maxScrollTop <= 0) {
+    return true;
+  }
+  // 사용자가 하단 근처를 보고 있을 때만 자동 하단 고정한다.
+  return afterList.scrollTop >= maxScrollTop - 72;
+}
+
+function stickAfterListToBottomIfNeeded(shouldStick: boolean) {
+  if (!shouldStick) {
+    return;
+  }
+  suppressAfterScrollVirtualRender = true;
+  afterList.scrollTop = afterList.scrollHeight;
+  updateScrollFadeState(afterList);
+  window.requestAnimationFrame(() => {
+    suppressAfterScrollVirtualRender = false;
+  });
+}
+
 async function scanMonitorDirectorySnapshot(rootPath: string) {
   if (!rootPath) {
     return [];
@@ -2513,13 +2728,21 @@ async function scanMonitorChangedPaths(changedPaths: string[]) {
   return window.desktopBridge.scanMonitorPaths(collapsedPaths);
 }
 
-async function refreshMonitorBaselineForPath(path: string, reason: string, notify = true) {
-  setMonitorProgressMessage(`스냅샷 생성 중: ${toCompactPath(path)}`);
-  setAppLoadingOverlay(true, `스냅샷 생성 중: ${toCompactPath(path)}`);
+async function refreshMonitorBaselineForPath(path: string, reason: string, notify = true, blockUi = false) {
+  const updateProgress = (message: string) => {
+    setMonitorProgressMessage(message);
+    if (blockUi) {
+      setAppLoadingOverlay(true, message);
+    }
+  };
+  updateProgress(`스냅샷 생성 중: ${toCompactPath(path)}`);
   try {
+    updateProgress(`스냅샷 생성 중 (디렉토리 스캔): ${toCompactPath(path)}`);
     const snapshot = await scanMonitorDirectorySnapshot(path);
-    monitorBaselines.set(path, buildMonitorBaseline(snapshot));
-    monitorLastSnapshotAt.set(path, Date.now());
+    updateProgress(`스냅샷 생성 중 (결과 반영): ${toCompactPath(path)}`);
+    const now = Date.now();
+    monitorLastSnapshotAt.set(path, now);
+    setWorkerBaseline(path, snapshot, now);
     monitorPendingEntriesByDirectory.set(path, []);
     recomputeMonitorPendingState();
     schedulePersistMonitorState();
@@ -2529,27 +2752,39 @@ async function refreshMonitorBaselineForPath(path: string, reason: string, notif
       appendStatusLog(`${reason}: ${toCompactPath(path)} 기준 ${snapshot.length}개 항목을 갱신했습니다.`, "success");
     }
   } finally {
-    setAppLoadingOverlay(false);
+    if (blockUi) {
+      setAppLoadingOverlay(false);
+    }
   }
 }
 
 async function recalculateMonitorPendingForPath(
   path: string,
   advanceSnapshotOnClear: boolean,
-  changedPaths?: string[]
+  changedPaths?: string[],
+  blockUi = false
 ) {
   await yieldToEventLoop();
-  const message = advanceSnapshotOnClear
-    ? `스냅샷 재계산 중: ${toCompactPath(path)}`
-    : `변경 감지 확인 중: ${toCompactPath(path)}`;
-  setMonitorProgressMessage(message);
-  if (advanceSnapshotOnClear) {
-    setAppLoadingOverlay(true, message);
-  }
+  const updateProgress = (message: string) => {
+    setMonitorProgressMessage(message);
+    if (blockUi) {
+      setAppLoadingOverlay(true, message);
+    }
+  };
+  updateProgress(
+    advanceSnapshotOnClear
+      ? `스냅샷 재계산 중: ${toCompactPath(path)}`
+      : `변경 감지 처리 중: ${toCompactPath(path)}`
+  );
   
   try {
-    const isIncremental = changedPaths && changedPaths.length > 0;
-    const pathsToScan = isIncremental ? collapseMonitorChangedPaths(changedPaths) : [path];
+    const isIncremental = Boolean(changedPaths && changedPaths.length > 0);
+    const pathsToScan = (changedPaths && changedPaths.length > 0) ? collapseMonitorChangedPaths(changedPaths) : [path];
+    updateProgress(
+      isIncremental
+        ? `증분 이벤트 수집 중: ${toCompactPath(path)}`
+        : `변경 대상 수집 중: ${toCompactPath(path)}`
+    );
     const scannedEntries = await window.desktopBridge.daemonCollectPendingEntries(pathsToScan);
     
     const normalizedRoot = normalizePathForCompare(path);
@@ -2557,50 +2792,44 @@ async function recalculateMonitorPendingForPath(
       (entry) => normalizePathForCompare(entry.path) !== normalizedRoot
     );
 
-    let nextPending: MonitorSnapshotEntry[];
-    if (isIncremental) {
-      const currentPending = monitorPendingEntriesByDirectory.get(path) ?? [];
-      const retained = currentPending.filter(
-        (entry) => !pathsToScan.some((p) => entry.path === p || isPathInFolderTree(entry.path, p))
-      );
-      
-      const candidateEntries = getMonitorCandidateEntries({
-        path,
-        entries: validScannedEntries,
-        baseline: monitorBaselines.get(path),
-        lastSnapshotAt: monitorLastSnapshotAt.get(path),
-        previousPendingEntries: currentPending
-      });
-
-      nextPending = collapseMonitorPendingEntries([...retained, ...candidateEntries]);
-    } else {
-      const candidateEntries = getMonitorCandidateEntries({
-        path,
-        entries: validScannedEntries,
-        baseline: monitorBaselines.get(path),
-        lastSnapshotAt: monitorLastSnapshotAt.get(path),
-        previousPendingEntries: monitorPendingEntriesByDirectory.get(path) ?? []
-      });
-
-      nextPending = collapseMonitorPendingEntries(candidateEntries);
-    }
+    const currentPending = monitorPendingEntriesByDirectory.get(path) ?? [];
+    
+    updateProgress(
+      isIncremental
+        ? `증분 이벤트 비교 중: ${toCompactPath(path)}`
+        : `변경 비교 중: ${toCompactPath(path)}`
+    );
+    const nextPending = await calculatePendingEntriesWorker(
+      path,
+      validScannedEntries,
+      isIncremental,
+      pathsToScan,
+      currentPending
+    );
     
     monitorPendingEntriesByDirectory.set(path, nextPending);
 
-    if (!monitorBaselines.has(path)) {
+    if (!monitorLastSnapshotAt.has(path)) {
+      updateProgress(`기준 스냅샷 보정 중: ${toCompactPath(path)}`);
       const snapshot = await scanMonitorDirectorySnapshot(path);
-      monitorBaselines.set(path, buildMonitorBaseline(snapshot));
-      monitorLastSnapshotAt.set(path, Date.now());
+      const now = Date.now();
+      monitorLastSnapshotAt.set(path, now);
+      setWorkerBaseline(path, snapshot, now);
     }
 
     await yieldToEventLoop();
 
+    updateProgress(
+      isIncremental
+        ? `증분 이벤트 반영 중: ${toCompactPath(path)}`
+        : `변경 비교 결과 반영 중: ${toCompactPath(path)}`
+    );
     recomputeMonitorPendingState();
     schedulePersistMonitorState();
     updateMonitorLabels();
     void scheduleAutoMonitorConvertIfNeeded();
   } finally {
-    if (advanceSnapshotOnClear) {
+    if (blockUi) {
       setAppLoadingOverlay(false);
     }
   }
@@ -2658,6 +2887,10 @@ function scheduleMonitorSnapshotCheck(delay = MONITOR_SNAPSHOT_CHECK_INTERVAL_MS
 }
 
 async function runAutoSnapshotRefresh(showToast = true) {
+  if (state.mainWindowVisible) {
+    scheduleMonitorSnapshotCheck();
+    return;
+  }
   if (monitorAutoSnapshotRunning || state.busy || state.monitorDirectoryPaths.length === 0) {
     scheduleMonitorSnapshotCheck();
     return;
@@ -2711,7 +2944,10 @@ async function runAutoSnapshotRefresh(showToast = true) {
 }
 
 async function runMonitorWatchRefresh(path: string, changedPaths: string[]) {
-  if (!state.monitorDirectoryPaths.includes(path) || !monitorBaselines.has(path)) {
+  if (state.mainWindowVisible) {
+    return;
+  }
+  if (!state.monitorDirectoryPaths.includes(path) || !monitorLastSnapshotAt.has(path)) {
     return;
   }
   if (monitorWatchRefreshRunningRoots.has(path)) {
@@ -2751,7 +2987,10 @@ async function runMonitorWatchRefresh(path: string, changedPaths: string[]) {
 }
 
 function scheduleMonitorWatchRefresh(path: string, changedPaths: string[] = [path], kind = "modify") {
-  if (!path || !state.monitorDirectoryPaths.includes(path) || !monitorBaselines.has(path)) {
+  if (state.mainWindowVisible) {
+    return;
+  }
+  if (!path || !state.monitorDirectoryPaths.includes(path) || !monitorLastSnapshotAt.has(path)) {
     return;
   }
   const pendingPaths = monitorWatchPendingPathsByRoot.get(path) ?? new Set<string>();
@@ -2783,6 +3022,9 @@ async function ensureMonitorWatchListeners() {
     return;
   }
   monitorWatchEventUnsubscribe = await window.desktopBridge.onMonitorWatchEvent((event) => {
+    if (state.mainWindowVisible) {
+      return;
+    }
     if (!isRelevantMonitorWatchKind(event.kind)) {
       return;
     }
@@ -2805,13 +3047,20 @@ async function ensureMonitorWatchListeners() {
   monitorWatchListenersReady = true;
 }
 
-async function startMonitorPolling(notify = true) {
+async function startMonitorPolling(notify = true, skipInitialComparison = false) {
   beginMonitorBackgroundTask();
   let success = true;
   let errorMessage = "";
   ++monitorStartGeneration;
   stopMonitorPolling();
   try {
+    if (state.mainWindowVisible) {
+      await window.desktopBridge.stopMonitorWatch();
+      recomputeMonitorPendingState();
+      updateMonitorLabels();
+      return;
+    }
+
     if (
       state.monitorDirectoryPaths.length === 0 ||
       !state.autoMonitorConvertEnabled
@@ -2820,7 +3069,7 @@ async function startMonitorPolling(notify = true) {
       await window.desktopBridge.stopMonitorWatch();
       
       if (state.monitorDirectoryPaths.length === 0) {
-        monitorBaselines.clear();
+        clearWorkerBaselines();
         monitorLastSnapshotAt.clear();
         monitorPendingEntriesByDirectory.clear();
         monitorDirectoryBookmarks.clear();
@@ -2835,7 +3084,7 @@ async function startMonitorPolling(notify = true) {
       return;
     }
 
-    const watchedPaths = state.monitorDirectoryPaths.filter((path) => monitorBaselines.has(path));
+    const watchedPaths = state.monitorDirectoryPaths.filter((path) => monitorLastSnapshotAt.has(path));
     if (watchedPaths.length === 0) {
       await window.desktopBridge.stopMonitorWatch();
       recomputeMonitorPendingState();
@@ -2852,8 +3101,10 @@ async function startMonitorPolling(notify = true) {
     setMonitorProgressMessage("모니터링 감지 준비 중...");
     await window.desktopBridge.startMonitorWatch(watchedPaths);
 
-    for (const path of watchedPaths) {
-      await recalculateMonitorPendingForPath(path, false);
+    if (!skipInitialComparison) {
+      for (const path of watchedPaths) {
+        await recalculateMonitorPendingForPath(path, false);
+      }
     }
     void scheduleAutoMonitorConvertIfNeeded();
     scheduleMonitorSnapshotCheck();
@@ -2870,7 +3121,7 @@ async function startMonitorPolling(notify = true) {
     if (shouldResetDirectory) {
       const previousPaths = [...state.monitorDirectoryPaths];
       state.monitorDirectoryPaths = [];
-      monitorBaselines.clear();
+      clearWorkerBaselines();
       monitorLastSnapshotAt.clear();
       monitorPendingEntriesByDirectory.clear();
       monitorDirectoryBookmarks.clear();
@@ -2898,12 +3149,12 @@ function startMonitorPollingInBackground(notify = true) {
   void startMonitorPolling(notify);
 }
 
-function scheduleInitialMonitorPolling(notify = true) {
+function scheduleInitialMonitorPolling(notify = true, skipInitialComparison = false) {
   stopMonitorPolling();
   updateMonitorLabels();
   monitorStartTimerId = window.setTimeout(() => {
     monitorStartTimerId = 0;
-    void startMonitorPolling(notify);
+    void startMonitorPolling(notify, skipInitialComparison);
   }, MONITOR_START_DELAY_MS);
 }
 
@@ -2928,14 +3179,14 @@ async function chooseMonitorDirectory() {
   updateMonitorLabels();
   appendStatusLog(`${toCompactPath(selected.path)} 모니터링 디렉토리를 추가했습니다. 첫 기준 스냅샷을 생성합니다...`, "idle");
   showCopyToast("모니터링 추가", [toCompactPath(selected.path)]);
-  
-  // 모니터링 폴더를 추가하면 즉시 스냅샷을 생성하여 대상 찾기나 자동 감지가 동작할 수 있는 기준을 만듭니다.
-  void refreshMonitorBaselineForPath(selected.path, "새 모니터링 디렉토리 등록", true);
-  
-  // 자동 감지가 켜져 있다면 Watcher를 켜기 위해 Initial Polling 스케줄링
-  if (state.autoMonitorConvertEnabled) {
-    scheduleInitialMonitorPolling(true);
-  }
+
+  // 모니터링 폴더를 추가하면 즉시 스냅샷을 생성하고, 완료 이후 Watcher를 시작한다.
+  void (async () => {
+    await refreshMonitorBaselineForPath(selected.path, "새 모니터링 디렉토리 등록", true);
+    if (state.autoMonitorConvertEnabled && state.monitorDirectoryPaths.includes(selected.path)) {
+      scheduleInitialMonitorPolling(true, true);
+    }
+  })();
 }
 
 function clearMonitorDirectory() {
@@ -2944,7 +3195,7 @@ function clearMonitorDirectory() {
   }
   stopMonitorPolling();
   state.monitorDirectoryPaths = [];
-  monitorBaselines.clear();
+  clearWorkerBaselines();
   monitorLastSnapshotAt.clear();
   monitorPendingEntriesByDirectory.clear();
   monitorDirectoryBookmarks.clear();
@@ -2962,7 +3213,7 @@ async function removeMonitorDirectory(path: string) {
   }
   stopMonitorPolling();
   state.monitorDirectoryPaths = state.monitorDirectoryPaths.filter((value) => value !== path);
-  monitorBaselines.delete(path);
+  deleteWorkerBaseline(path);
   monitorLastSnapshotAt.delete(path);
   monitorPendingEntriesByDirectory.delete(path);
   monitorDirectoryBookmarks.delete(path);
@@ -2971,7 +3222,7 @@ async function removeMonitorDirectory(path: string) {
   updateMonitorLabels();
   appendStatusLog(`${toCompactPath(path)} 모니터링을 해제했습니다.`, "idle");
   showCopyToast("모니터링 해제", [toCompactPath(path)]);
-  if (state.monitorDirectoryPaths.some((value) => monitorBaselines.has(value))) {
+  if (state.monitorDirectoryPaths.some((value) => monitorLastSnapshotAt.has(value))) {
     scheduleInitialMonitorPolling(false);
   } else {
     scheduleMonitorSnapshotCheck(500);
@@ -2984,25 +3235,54 @@ async function applyPendingMonitorChanges() {
     return;
   }
 
-  const hasAnyBaseline = state.monitorDirectoryPaths.some((path) => monitorBaselines.has(path));
-  if (!hasAnyBaseline) {
-    setStatus("스냅샷 기준이 없습니다. 모니터링 디렉토리를 추가해 기준 스냅샷을 준비해 주세요.", "error");
-    return;
-  }
+  const pendingCountAtClick = state.monitorPendingPaths.size;
+  const currentMode = resolveMonitorApplyMode(pendingCountAtClick);
+  state.monitorApplyMode = currentMode;
 
   setBusy(true);
-  setBeforeListLoadingOverlay(true, "변환 대상을 찾는 중입니다...");
+  setBeforeListLoadingOverlay(
+    true,
+    currentMode === "addDetectedTargets" ? "변환 대상으로 추가 중입니다..." : "변환 대상을 찾는 중입니다..."
+  );
 
   try {
-    const pendingPaths = Array.from(state.monitorPendingPaths);
-    let { pathsToEnqueue, excludedPaths } = await filterAlreadyHandledMonitorPendingPaths(pendingPaths);
+    if (currentMode === "addDetectedTargets") {
+      const pendingPaths = Array.from(state.monitorPendingPaths);
+      const { pathsToEnqueue, excludedPaths } = await filterAlreadyHandledMonitorPendingPaths(pendingPaths);
 
-    if (pathsToEnqueue.length > 0) {
-      appendStatusLog("자동 감지된 대기열이 있어 전체 스캔을 건너뛰고 즉시 수집합니다.", "idle");
-    } else {
+      if (excludedPaths.length > 0) {
+        clearMonitorPendingEntriesByPaths(excludedPaths);
+        appendStatusLog(
+          `변환 대상으로 추가: 이미 처리된 ${excludedPaths.length}개 항목은 제외했습니다.`,
+          "idle"
+        );
+      }
+
+      if (pathsToEnqueue.length === 0) {
+        appendStatusLog("변환 대상으로 추가할 감지 항목이 없습니다.", "success");
+        return;
+      }
+
+      appendStatusLog(`변환 대상으로 추가: ${pathsToEnqueue.length}개를 원본 파일 목록에 추가합니다.`, "success");
+      const addedPaths = await enqueuePaths(pathsToEnqueue, true, true);
+      if (addedPaths.length > 0) {
+        clearMonitorPendingEntriesByPaths(addedPaths);
+      }
+      return;
+    }
+
+    const hasAnyBaseline = state.monitorDirectoryPaths.some((path) => monitorLastSnapshotAt.has(path));
+    if (!hasAnyBaseline) {
+      setStatus("스냅샷 기준이 없습니다. 모니터링 디렉토리를 추가해 기준 스냅샷을 준비해 주세요.", "error");
+      return;
+    }
+
+    let pathsToEnqueue: string[] = [];
+    let excludedPaths: string[] = [];
+    {
       appendStatusLog("스냅샷 기준으로 변환 대상을 다시 검색합니다.", "idle");
       for (const path of state.monitorDirectoryPaths) {
-        if (!monitorBaselines.has(path)) {
+        if (!monitorLastSnapshotAt.has(path)) {
           continue;
         }
         await recalculateMonitorPendingForPath(path, false);
@@ -3027,7 +3307,10 @@ async function applyPendingMonitorChanges() {
 
     if (pathsToEnqueue.length > 0) {
       appendStatusLog(`변환 대상 검색 완료: ${pathsToEnqueue.length}개를 원본 파일 목록에 추가합니다.`, "success");
-      await enqueuePaths(pathsToEnqueue, true, true);
+      const addedPaths = await enqueuePaths(pathsToEnqueue, true, true);
+      if (addedPaths.length > 0) {
+        clearMonitorPendingEntriesByPaths(addedPaths);
+      }
     } else {
       appendStatusLog("변환 대상 검색 완료: 새로 추가할 항목이 없습니다.", "success");
     }
@@ -3041,10 +3324,10 @@ async function applyPendingMonitorChanges() {
   }
 }
 
-async function enqueuePaths(filePaths: string[], nfdOnly = false, shallow = false) {
+async function enqueuePaths(filePaths: string[], nfdOnly = false, shallow = false): Promise<string[]> {
   if (filePaths.length === 0) {
     setStatus("파일 경로를 읽지 못했습니다. Finder에서 실제 파일을 드롭해 주세요.", "error");
-    return;
+    return [];
   }
 
   const addedDuringInspect = new Set<string>();
@@ -3101,7 +3384,7 @@ async function enqueuePaths(filePaths: string[], nfdOnly = false, shallow = fals
     const addedCount = addedDuringInspect.size;
     if (addedCount === 0) {
       setStatus("이미 원본/변환 목록에 있는 항목입니다.", "idle");
-      return;
+      return [];
     }
     recalculateFolderFileCounts();
     renderListsSync();
@@ -3119,12 +3402,14 @@ async function enqueuePaths(filePaths: string[], nfdOnly = false, shallow = fals
         `원본 파일 목록에 파일 ${addedFileCount}개, 폴더 ${addedFolderCount}개 추가 (${skippedCount}개 중복 제외)`,
         "success"
       );
-      return;
+      return Array.from(addedDuringInspect);
     }
     setStatus(`원본 파일 목록에 파일 ${addedFileCount}개, 폴더 ${addedFolderCount}개를 추가했습니다.`, "success");
+    return Array.from(addedDuringInspect);
   } catch (error) {
     const message = error instanceof Error ? error.message : "파일 정보를 확인하는 중 오류가 발생했습니다.";
     setStatus(message, "error");
+    return [];
   } finally {
     if (unsubscribeInspect) {
       unsubscribeInspect();
@@ -3163,12 +3448,21 @@ async function convertSourcePaths(sourcePaths: string[], isBackgroundAutoConvert
     const finalResults: NormalizeResult[] = [];
     const beforeListCountBefore = state.beforeItems.length;
     const afterListCountBefore = state.results.length;
+    const RENDER_INTERVAL_MS = 220;
+    const FOLDER_COUNT_RECALC_INTERVAL_MS = 1000;
+    let lastRenderedAt = performance.now();
+    let lastFolderCountRecalcAt = performance.now();
+    let renderQueued = false;
+    let folderCountsDirty = false;
+    let monitorPendingChangedByConversion = false;
+    state.selectedOutputPaths.clear();
 
     for (let offset = 0; offset < sortedSourcePaths.length; offset += CONVERT_BATCH_SIZE) {
       const batchPaths = sortedSourcePaths.slice(offset, offset + CONVERT_BATCH_SIZE);
       if (batchPaths.length === 0) {
         continue;
       }
+      const shouldStickAfterRender = shouldStickAfterListToBottom();
 
       const converted = await window.desktopBridge.daemonConvertTargets(batchPaths);
       const batchResults = converted.results.map((item) =>
@@ -3208,25 +3502,36 @@ async function convertSourcePaths(sourcePaths: string[], isBackgroundAutoConvert
           }
         }
       });
+      folderCountsDirty = true;
 
-      clearConvertedMonitorPendingEntries(batchConvertedSourcePathSet, batchConvertedDirectoryPaths);
+      monitorPendingChangedByConversion =
+        clearConvertedMonitorPendingEntries(batchConvertedSourcePathSet, batchConvertedDirectoryPaths, true) ||
+        monitorPendingChangedByConversion;
 
       uniqueCount += converted.uniqueCount > 0 ? converted.uniqueCount : batchResults.length;
       processedCount = Math.min(requestedCount, processedCount + (converted.uniqueCount > 0 ? converted.uniqueCount : batchPaths.length));
       setProgress(processedCount, requestedCount);
 
-      recalculateFolderFileCounts();
-      state.selectedOutputPaths.clear();
-      renderListsSync();
-      didRenderListInTry = true;
-
-      window.requestAnimationFrame(() => {
-        afterList.scrollTop = afterList.scrollHeight;
-        updateScrollFadeState(afterList);
-      });
+      const isLastBatch = offset + CONVERT_BATCH_SIZE >= sortedSourcePaths.length;
+      const now = performance.now();
+      const shouldRenderNow = isLastBatch || now - lastRenderedAt >= RENDER_INTERVAL_MS;
+      if (shouldRenderNow) {
+        if (folderCountsDirty && (isLastBatch || now - lastFolderCountRecalcAt >= FOLDER_COUNT_RECALC_INTERVAL_MS)) {
+          recalculateFolderFileCounts();
+          folderCountsDirty = false;
+          lastFolderCountRecalcAt = now;
+        }
+        renderListsSync();
+        didRenderListInTry = true;
+        renderQueued = false;
+        lastRenderedAt = now;
+        stickAfterListToBottomIfNeeded(shouldStickAfterRender);
+        await yieldToEventLoop();
+      } else {
+        renderQueued = true;
+      }
 
       if (isBackgroundAutoConvert && batchResults.length > 0) {
-        updateTrayBackgroundBadge(trayBackgroundConvertedCount + batchResults.length);
         const historyEntries: AutoConvertHistoryEntry[] = batchResults.map((item) => ({
           timestamp: Date.now(),
           sourcePath: item.sourcePath,
@@ -3240,6 +3545,7 @@ async function convertSourcePaths(sourcePaths: string[], isBackgroundAutoConvert
         try {
           autoConvertHistoryCount = await window.desktopBridge.appendAutoConvertHistory(historyEntries);
           updateAutoConvertHistoryBadge();
+          await maybePromptAutoConvertHistoryCleanup(autoConvertHistoryCount, "백그라운드 자동 변환 누적");
         } catch (error) {
           appendStatusLog(
             `자동 변환 내역 저장에 실패했습니다. 원인: ${getErrorMessage(error, "내역 저장 실패")}`,
@@ -3249,6 +3555,24 @@ async function convertSourcePaths(sourcePaths: string[], isBackgroundAutoConvert
       }
 
       void batchResults;
+    }
+
+    if (monitorPendingChangedByConversion) {
+      recomputeMonitorPendingState();
+      updateMonitorLabels();
+      schedulePersistMonitorState();
+    }
+
+    if (folderCountsDirty) {
+      recalculateFolderFileCounts();
+      folderCountsDirty = false;
+    }
+
+    if (renderQueued) {
+      const shouldStickAfterRender = shouldStickAfterListToBottom();
+      renderListsSync();
+      didRenderListInTry = true;
+      stickAfterListToBottomIfNeeded(shouldStickAfterRender);
     }
 
     const completedTotal = uniqueCount > 0 ? uniqueCount : uniqueSourcePaths.length;
@@ -3331,10 +3655,11 @@ async function convertAllBeforeConvertibleItems() {
 
 function clearConvertedMonitorPendingEntries(
   convertedSourcePathSet: Set<string>,
-  convertedDirectoryPaths: Set<string>
+  convertedDirectoryPaths: Set<string>,
+  deferUiSync = false
 ) {
   if (monitorPendingEntriesByDirectory.size === 0) {
-    return;
+    return false;
   }
 
   let changed = false;
@@ -3358,10 +3683,13 @@ function clearConvertedMonitorPendingEntries(
   }
 
   if (changed) {
-    recomputeMonitorPendingState();
-    updateMonitorLabels();
-    schedulePersistMonitorState();
+    if (!deferUiSync) {
+      recomputeMonitorPendingState();
+      updateMonitorLabels();
+      schedulePersistMonitorState();
+    }
   }
+  return changed;
 }
 
 function clearAllItems() {
@@ -3883,6 +4211,11 @@ beforeList.addEventListener("scroll", () => {
 });
 
 afterList.addEventListener("scroll", () => {
+  if (suppressAfterScrollVirtualRender) {
+    updateScrollFadeState(afterList);
+    hideAfterContextMenu();
+    return;
+  }
   if (afterScrollRafId === 0) {
     if (afterList.dataset.virtualActive === "1") {
       showVirtualLoading("after");
@@ -4052,13 +4385,13 @@ async function initializeMonitoring() {
     state.monitorDirectoryPaths = await loadPersistedMonitorState();
     updateMonitorLabels();
     void scheduleAutoMonitorConvertIfNeeded();
-    if (state.monitorDirectoryPaths.some((path) => monitorBaselines.has(path))) {
-      scheduleInitialMonitorPolling(false);
+    if (state.monitorDirectoryPaths.some((path) => monitorLastSnapshotAt.has(path))) {
+      scheduleInitialMonitorPolling(false, true);
     }
     scheduleMonitorSnapshotCheck(Math.min(MONITOR_START_DELAY_MS, 1000));
   } catch (error) {
     state.monitorDirectoryPaths = [];
-    monitorBaselines.clear();
+    clearWorkerBaselines();
     monitorLastSnapshotAt.clear();
     monitorPendingEntriesByDirectory.clear();
     monitorDirectoryBookmarks.clear();
@@ -4081,7 +4414,13 @@ void window.desktopBridge.onMainWindowVisibility((visible) => {
   }
 
   if (visible) {
-    updateTrayBackgroundBadge(0);
+    stopMonitorPolling();
+    return;
+  }
+
+  const hasWatchedPath = state.monitorDirectoryPaths.some((path) => monitorLastSnapshotAt.has(path));
+  if (hasWatchedPath) {
+    scheduleInitialMonitorPolling(false);
   }
 }).then((unsubscribe) => {
   mainWindowVisibilityUnsubscribe = unsubscribe;
@@ -4097,6 +4436,7 @@ void window.desktopBridge
   .then((count) => {
     autoConvertHistoryCount = count;
     updateAutoConvertHistoryBadge();
+    void maybePromptAutoConvertHistoryCleanup(count, "앱 시작 시 내역 조회");
   })
   .catch((error) => {
     appendStatusLog(
@@ -4109,6 +4449,7 @@ void window.desktopBridge
   .onAutoConvertHistoryCount((count) => {
     autoConvertHistoryCount = count;
     updateAutoConvertHistoryBadge();
+    void maybePromptAutoConvertHistoryCleanup(count, "내역 변경 이벤트");
   })
   .catch((error) => {
     appendStatusLog(

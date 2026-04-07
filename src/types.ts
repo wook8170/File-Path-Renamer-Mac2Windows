@@ -17,6 +17,8 @@ export type BeforeItem = RawBeforeItem & {
   chipVariant: "folder" | "apple" | "window";
 };
 
+export type MonitorApplyMode = "addDetectedTargets" | "findTargets";
+
 export type AppState = {
   beforeItems: BeforeItem[];
   selectedBeforePaths: Set<string>;
@@ -35,6 +37,7 @@ export type AppState = {
   mainWindowVisible: boolean;
   monitorDirectoryPaths: string[];
   monitorPendingPaths: Set<string>;
+  monitorApplyMode: MonitorApplyMode;
   monitorPendingFileCount: number;
   monitorPendingDirectoryCount: number;
   monitorProgressMessage: string;

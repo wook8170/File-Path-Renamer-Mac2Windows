@@ -791,7 +791,28 @@ fn dedupe_monitor_entries_by_path(entries: Vec<MonitorSnapshotEntry>) -> Vec<Mon
 fn collapse_monitor_pending_entries(entries: Vec<MonitorSnapshotEntry>) -> Vec<MonitorSnapshotEntry> {
     let mut deduped = dedupe_monitor_entries_by_path(entries);
     deduped.sort_by(|a, b| a.path.cmp(&b.path));
-    deduped
+    
+    let mut kept = Vec::new();
+    let mut current_parent_path: Option<String> = None;
+    
+    for entry in deduped {
+        if let Some(parent) = &current_parent_path {
+            if is_path_in_folder_tree_str(&entry.path, parent) {
+                continue;
+            }
+        }
+        
+        let path_clone = entry.path.clone();
+        let is_dir = entry.is_directory;
+        
+        kept.push(entry);
+        
+        if is_dir {
+            current_parent_path = Some(path_clone);
+        }
+    }
+    
+    kept
 }
 
 fn collect_pending_entries_for_root_sync(root_path: &str) -> Result<Vec<MonitorSnapshotEntry>, String> {
@@ -921,15 +942,32 @@ fn emit_auto_convert_history_count<R: tauri::Runtime>(app: &tauri::AppHandle<R>,
     let _ = app.emit("auto-convert-history-count", count);
 }
 
-const MAX_AUTO_CONVERT_HISTORY_LEN: usize = 500;
-
-fn trim_auto_convert_history(entries: &mut Vec<AutoConvertHistoryEntry>) -> bool {
-    if entries.len() <= MAX_AUTO_CONVERT_HISTORY_LEN {
-        return false;
+fn dedupe_auto_convert_history_by_source(
+    entries: Vec<AutoConvertHistoryEntry>,
+) -> Vec<AutoConvertHistoryEntry> {
+    if entries.len() <= 1 {
+        return entries;
     }
-    let keep_from = entries.len() - MAX_AUTO_CONVERT_HISTORY_LEN;
-    *entries = entries.split_off(keep_from);
-    true
+
+    let mut latest_index_by_source: HashMap<String, usize> = HashMap::new();
+    for (idx, entry) in entries.iter().enumerate() {
+        latest_index_by_source.insert(entry.source_path.clone(), idx);
+    }
+
+    entries
+        .into_iter()
+        .enumerate()
+        .filter_map(|(idx, entry)| {
+            if latest_index_by_source
+                .get(&entry.source_path)
+                .is_some_and(|latest_idx| *latest_idx == idx)
+            {
+                Some(entry)
+            } else {
+                None
+            }
+        })
+        .collect()
 }
 
 #[tauri::command]
@@ -962,22 +1000,16 @@ fn save_monitor_state(
 
 #[tauri::command]
 fn load_auto_convert_history(app: tauri::AppHandle) -> Result<Vec<AutoConvertHistoryEntry>, String> {
-    let mut entries = read_auto_convert_history(&app)?;
-    if trim_auto_convert_history(&mut entries) {
-        write_auto_convert_history(&app, &entries)?;
-        emit_auto_convert_history_count(&app, entries.len());
-    }
-    Ok(entries)
+    let entries = read_auto_convert_history(&app)?;
+    let deduped = dedupe_auto_convert_history_by_source(entries);
+    Ok(deduped)
 }
 
 #[tauri::command]
 fn get_auto_convert_history_count(app: tauri::AppHandle) -> Result<usize, String> {
-    let mut entries = read_auto_convert_history(&app)?;
-    if trim_auto_convert_history(&mut entries) {
-        write_auto_convert_history(&app, &entries)?;
-        emit_auto_convert_history_count(&app, entries.len());
-    }
-    Ok(entries.len())
+    let entries = read_auto_convert_history(&app)?;
+    let deduped = dedupe_auto_convert_history_by_source(entries);
+    Ok(deduped.len())
 }
 
 #[tauri::command]
@@ -990,9 +1022,9 @@ fn append_auto_convert_history(
     }
     let mut current = read_auto_convert_history(&app)?;
     current.extend(entries);
-    trim_auto_convert_history(&mut current);
-    write_auto_convert_history(&app, &current)?;
-    let count = current.len();
+    let deduped = dedupe_auto_convert_history_by_source(current);
+    write_auto_convert_history(&app, &deduped)?;
+    let count = deduped.len();
     emit_auto_convert_history_count(&app, count);
     Ok(count)
 }
