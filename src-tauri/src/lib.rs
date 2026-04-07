@@ -761,7 +761,7 @@ fn scan_monitor_paths_sync(paths: &[String]) -> Result<Vec<MonitorSnapshotEntry>
         if !path.exists() {
             continue;
         }
-        collect_monitor_snapshot_entries_for_target(&path, &mut seen, &mut results, false)
+        collect_monitor_snapshot_entries_for_target(&path, &mut seen, &mut results, true)
             .map_err(|e| format!("모니터링 경로 부분 스캔 실패: {e}"))?;
     }
 
@@ -788,24 +788,14 @@ fn dedupe_monitor_entries_by_path(entries: Vec<MonitorSnapshotEntry>) -> Vec<Mon
     by_path.into_values().collect()
 }
 
-fn collapse_monitor_pending_entries(mut entries: Vec<MonitorSnapshotEntry>) -> Vec<MonitorSnapshotEntry> {
+fn collapse_monitor_pending_entries(entries: Vec<MonitorSnapshotEntry>) -> Vec<MonitorSnapshotEntry> {
     let mut deduped = dedupe_monitor_entries_by_path(entries);
-    deduped.sort_by_key(|entry| entry.path.len());
-
-    let mut kept = Vec::<MonitorSnapshotEntry>::new();
-    for entry in deduped {
-        let covered = kept.iter().any(|candidate| {
-            candidate.is_directory && is_path_in_folder_tree_str(&entry.path, &candidate.path)
-        });
-        if !covered {
-            kept.push(entry);
-        }
-    }
-    kept
+    deduped.sort_by(|a, b| a.path.cmp(&b.path));
+    deduped
 }
 
 fn collect_pending_entries_for_root_sync(root_path: &str) -> Result<Vec<MonitorSnapshotEntry>, String> {
-    let snapshot_entries = scan_monitor_directory_sync(root_path)?;
+    let snapshot_entries = scan_monitor_paths_sync(&[root_path.to_string()])?;
     let mut pending = Vec::<MonitorSnapshotEntry>::new();
     for entry in snapshot_entries {
         let source_name = Path::new(&entry.path)

@@ -23,29 +23,20 @@ export function dedupeMonitorEntriesByPath(entries: MonitorSnapshotEntry[]) {
 
 export function collapseMonitorPendingEntries(entries: MonitorSnapshotEntry[]) {
   const deduped = dedupeMonitorEntriesByPath(entries);
-  const sorted = deduped.sort((left, right) => left.path.length - right.path.length);
-  const kept: MonitorSnapshotEntry[] = [];
-  for (const entry of sorted) {
-    const coveredByParent = kept.some((candidate) => candidate.isDirectory && isPathInFolderTree(entry.path, candidate.path));
-    if (!coveredByParent) {
-      kept.push(entry);
-    }
-  }
-  return kept;
+  return deduped.sort((a, b) => a.path.localeCompare(b.path));
 }
 
 export function collapseMonitorChangedPaths(paths: string[]) {
-  const deduped = Array.from(new Set(paths.filter((path) => path.trim().length > 0))).sort(
-    (left, right) => left.length - right.length
-  );
+  const deduped = Array.from(new Set(paths.filter((path) => path.trim().length > 0))).sort();
   const kept: string[] = [];
+  let currentParent: string | null = null;
+  
   for (const path of deduped) {
-    const coveredByParent = kept.some(
-      (candidate) => candidate === path || isPathInFolderTree(path, candidate)
-    );
-    if (!coveredByParent) {
-      kept.push(path);
+    if (currentParent && isPathInFolderTree(path, currentParent)) {
+      continue;
     }
+    currentParent = path;
+    kept.push(path);
   }
   return kept;
 }

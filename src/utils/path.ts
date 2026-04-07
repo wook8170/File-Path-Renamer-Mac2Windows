@@ -46,7 +46,12 @@ export function escapeHtml(value: string) {
 }
 
 export function getErrorMessage(error: unknown, fallback: string) {
+  console.error("[Error Log]", error);
+  
   if (error instanceof Error && error.message.trim().length > 0) {
+    // 만약 stack trace가 있다면 에러 메시지에 함께 포함시킬 수도 있지만, 
+    // UI에 너무 길게 표시될 수 있으므로 console.error로 상세 내역을 찍고 
+    // UI용으로는 기존처럼 메시지만 반환하거나 상황에 맞게 덧붙일 수 있습니다.
     return error.message;
   }
   if (typeof error === "string" && error.trim().length > 0) {
